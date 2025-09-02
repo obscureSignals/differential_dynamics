@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "differential_dynamics"
+version = "0.0.1"
+authors = [{ name = "Brendan Thompson" }]
+description = "Differentiable dynamic range processing (research)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "torch>=2.1",
+  "numpy",
+]
+
+[tool.setuptools]
+packages = [
+  "differential_dynamics",
+  "differential_dynamics.backends",
+  "differential_dynamics.backends.torch",
+  "third_party.torchcomp_core",
+  "third_party.torchcomp_core.torchcomp",
+]
+package-dir = {"" = "."}
+
