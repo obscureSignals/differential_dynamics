@@ -9,19 +9,29 @@ from third_party.torchcomp_core.torchcomp.core import compressor_core as _hard_c
 
 
 def _alpha_from_tau(tau_sec: torch.Tensor, fs: float) -> torch.Tensor:
+    """Map a time constant in seconds to a stable smoothing coefficient.
+
+    Uses exponential Euler discretization: alpha = exp(-1/(tau*fs)), ensuring
+    0 < alpha < 1 for tau > 0. Smaller alpha -> faster envelope response.
+    """
     tau_sec = torch.as_tensor(tau_sec, device=tau_sec.device, dtype=tau_sec.dtype)
     return torch.exp(-1.0 / (tau_sec * fs))
 
 
 def _soft_gate(x_env_t, e_prev, k: float = 50.0):
+    """Smoothly blend attack vs release based on whether x_env exceeds state.
+
+    s ≈ 1 (attack) when x_env_t > e_prev, and ≈ 0 (release) otherwise.
+    k controls sharpness; larger k approximates a hard switch.
+    """
     return torch.sigmoid(k * (x_env_t - e_prev))
 
 
 class EnvelopeAR(nn.Module):
-    """Attack/Release envelope with switchable gating.
+    """Attack/Release envelope with switchable gating strategies.
 
     mode: one of {"hard", "sigmoid"}
-      - hard: uses upstream hard if/else via torchcomp core
+      - hard: uses upstream hard if/else via torchcomp core (piecewise-diff)
       - sigmoid: fully differentiable blend between attack and release
     """
 
@@ -32,11 +42,14 @@ class EnvelopeAR(nn.Module):
         self.k = float(k)
 
     def forward(self, x_env: torch.Tensor, tau_a: torch.Tensor, tau_r: torch.Tensor) -> torch.Tensor:
-        """Compute smoothed envelope given a non-negative detector input x_env (e.g., RMS or |x|).
-        Shapes:
-          x_env: (B, T), tau_a: (B,) or scalar tensor, tau_r: (B,) or scalar tensor
+        """Compute smoothed envelope e from a non-negative detector input x_env.
+
+        Args:
+          x_env: (B, T) detector input, e.g., |x| or RMS(x). Must be ≥ 0.
+          tau_a: (B,) or scalar tensor, attack time in seconds (> 0).
+          tau_r: (B,) or scalar tensor, release time in seconds (> 0).
         Returns:
-          e: (B, T)
+          e: (B, T) smoothed envelope.
         """
         assert x_env.ndim == 2
         B, T = x_env.shape
@@ -50,7 +63,7 @@ class EnvelopeAR(nn.Module):
             # The upstream core signature is compressor_core(x, zi, at, rt)
             # where it applies y_t = (1-coef)*y_{t-1} + coef*x_t with hard if/else
             zi = torch.zeros(B, device=x_env.device, dtype=x_env.dtype)
-            # We pass the target coefficients as at, rt
+            # Pass the coefficients as (at, rt). This returns only y (the envelope).
             return _hard_core(x_env, zi, alpha_a, alpha_r)
 
         elif self.mode == "sigmoid":
@@ -62,6 +75,7 @@ class EnvelopeAR(nn.Module):
             k = self.k
             for t in range(T):
                 xt = x_env[:, t]
+                # Smooth gate between attack and release coefficients.
                 s = _soft_gate(xt, e_prev, k)
                 alpha_t = s * alpha_a.squeeze(1) + (1 - s) * alpha_r.squeeze(1)
                 e_t = (1 - alpha_t) * xt + alpha_t * e_prev

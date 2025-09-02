@@ -17,70 +17,39 @@ __all__ = [
 
 
 def amp2db(x: torch.Tensor) -> torch.Tensor:
-    """Convert amplitude to decibels.
+    """Convert amplitude to decibels using 20*log10(x).
 
-    Args:
-        x (torch.Tensor): Input amplitude.
-
-    Returns:
-        torch.Tensor: Output decibels.
-
+    Note: x must be strictly positive to avoid -inf. Upstream callers enforce
+    this (e.g., assert x_rms > 0). Add an epsilon externally if needed.
     """
     return 20 * torch.log10(x)
 
 
 def db2amp(x: torch.Tensor) -> torch.Tensor:
-    """Convert decibels to amplitude.
-
-    Args:
-        x (torch.Tensor): Input decibels.
-
-    Returns:
-        torch.Tensor: Output amplitude.
-
-    """
+    """Convert decibels to linear amplitude via 10 ** (x / 20)."""
     return 10 ** (x / 20)
 
 
 def ms2coef(ms: torch.Tensor, sr: int) -> torch.Tensor:
-    """Convert milliseconds to coefficient.
+    """Map milliseconds to a one-pole smoothing coefficient in (0, 1).
 
-    Args:
-        ms (torch.Tensor): Input milliseconds.
-        sr (int): Sample rate.
-
-    Returns:
-        torch.Tensor: Output coefficient.
-
+    Uses a 10–90% envelope-time convention via the factor 2200/sr. This differs
+    from the more common exponential Euler mapping alpha = exp(-1/(tau*fs)) but
+    is consistent across the API when paired with coef2ms.
     """
     return 1 - torch.exp(-2200 / ms / sr)
 
 
 def coef2ms(coef: torch.Tensor, sr: int) -> torch.Tensor:
-    """Convert coefficient to milliseconds.
-
-    Args:
-        coef (torch.Tensor): Input coefficient.
-        sr (int): Sample rate.
-
-    Returns:
-        torch.Tensor: Output milliseconds.
-
-    """
+    """Inverse of ms2coef: map smoothing coefficient back to milliseconds."""
     return -2200 / (sr * torch.log(1 - coef))
 
 
 def avg(rms: torch.Tensor, avg_coef: Union[torch.Tensor, float]):
-    """Compute the running average of a signal.
+    """Compute a running average (one-pole IIR) of a non-negative sequence.
 
-    Args:
-        rms (torch.Tensor): Input signal.
-        avg_coef (torch.Tensor): Coefficient for the average RMS.
-
-    Shape:
-        - rms: :math:`(B, T)` where :math:`B` is the batch size and :math:`T` is the number of samples.
-        - avg_coef: :math:`(B,)` or a scalar.
-
+    The recursion is: y[n] = (1 - a) * y[n-1] + a * x[n], with a = avg_coef.
+    Implemented via sample_wise_lpc for numerical efficiency over batches.
     """
 
     avg_coef = torch.as_tensor(
@@ -103,26 +72,15 @@ def compexp_gain(
     at: Union[torch.Tensor, float],
     rt: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    """Compressor-Expander gain function.
+    """Compressor/Expander gain computer (dB-domain static curve + smoothing).
 
-    Args:
-        x_rms (torch.Tensor): Input signal RMS.
-        comp_thresh (torch.Tensor): Compressor threshold in dB.
-        comp_ratio (torch.Tensor): Compressor ratio.
-        exp_thresh (torch.Tensor): Expander threshold in dB.
-        exp_ratio (torch.Tensor): Expander ratio.
-        at (torch.Tensor): Attack time.
-        rt (torch.Tensor): Release time.
+    Pipeline:
+      1) Convert x_rms to dB.
+      2) Compute a piecewise-linear dB gain g_db using comp/exp slopes.
+      3) Clamp g_db <= 0 via (-x).relu().neg() pattern.
+      4) Convert to linear factor and smooth with hard A/R one-pole.
 
-    Shape:
-        - x_rms: :math:`(B, T)` where :math:`B` is the batch size and :math:`T` is the number of samples.
-        - comp_thresh: :math:`(B,)` or a scalar.
-        - comp_ratio: :math:`(B,)` or a scalar.
-        - exp_thresh: :math:`(B,)` or a scalar.
-        - exp_ratio: :math:`(B,)` or a scalar.
-        - at: :math:`(B,)` or a scalar.
-        - rt: :math:`(B,)` or a scalar.
-
+    Returns linear gain (B, T) to multiply with the signal.
     """
     device, dtype = x_rms.device, x_rms.dtype
     factory_func = lambda x: torch.as_tensor(
@@ -135,16 +93,19 @@ def compexp_gain(
     at = factory_func(at)
     rt = factory_func(rt)
 
+    # Domain/sanity checks. x_rms must be > 0 to avoid log10 issues.
     assert torch.all(x_rms > 0)
     assert torch.all(comp_ratio > 1)
+    # exp_ratio < 1 corresponds to downward expansion below exp_thresh.
     assert torch.all(exp_ratio < 1) and torch.all(exp_ratio > 0)
     assert torch.all(at > 0) and torch.all(at < 1)
     assert torch.all(rt > 0) and torch.all(rt < 1)
 
-    comp_slope = 1 - 1 / comp_ratio
-    exp_slope = 1 - 1 / exp_ratio
+    comp_slope = 1 - 1 / comp_ratio  # slope in dB for the compressor branch
+    exp_slope = 1 - 1 / exp_ratio    # slope in dB for the expander branch
 
     log_x_rms = amp2db(x_rms)
+    # Minimum of the two linear segments, then clamp positive parts to 0 dB.
     g = (
         torch.minimum(
             comp_slope[:, None] * (comp_thresh[:, None] - log_x_rms),
@@ -155,6 +116,7 @@ def compexp_gain(
         .neg()
     )
     f = db2amp(g)
+    # Smoothing initial state: 1.0 gain.
     zi = x_rms.new_ones(f.shape[0])
     return compressor_core(f, zi, at, rt)
 
@@ -165,21 +127,12 @@ def limiter_gain(
     at: torch.Tensor,
     rt: torch.Tensor,
 ) -> torch.Tensor:
-    """Limiter gain function.
-    This implementation use the same attack and release time for level detection and gain smoothing.
+    """Peak limiter gain computer.
 
-    Args:
-        x (torch.Tensor): Input signal.
-        threshold (torch.Tensor): Limiter threshold in dB.
-        at (torch.Tensor): Attack time.
-        rt (torch.Tensor): Release time.
-
-    Shape:
-        - x: :math:`(B, T)` where :math:`B` is the batch size and :math:`T` is the number of samples.
-        - threshold: :math:`(B,)` or a scalar.
-        - at: :math:`(B,)` or a scalar.
-        - rt: :math:`(B,)` or a scalar.
-
+    This uses the same one-pole with hard A/R for both peak detection and gain
+    smoothing. The peak detector runs on |x| with (rt, at) swapped (fast attack,
+    slow release), then we compute the instantaneous limiting factor f = min(1,
+    T_lin / x_peak). Finally we smooth f with (at, rt).
     """
     assert torch.all(threshold <= 0)
     assert torch.all(at > 0) and torch.all(at < 1)
@@ -194,6 +147,8 @@ def limiter_gain(
 
     zi = x.new_zeros(x.shape[0])
     lt = db2amp(threshold)
+    # Peak detection: note the swapped coefficients (rt, at)
     x_peak = compressor_core(x.abs(), zi, rt, at)
+    # f = clamp(T_lin / x_peak, 0, 1) written branchlessly
     f = F.relu(1 - lt[:, None] / x_peak).neg() + 1
     return compressor_core(f, torch.ones_like(zi), at, rt)
