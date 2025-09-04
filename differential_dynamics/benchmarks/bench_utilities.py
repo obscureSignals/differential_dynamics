@@ -21,12 +21,6 @@ def rmse_db(g_ref: torch.Tensor, g_hat: torch.Tensor, mask: torch.Tensor | None 
     return torch.sqrt(torch.mean(diff**2))
 
 
-def envelope_amplitude(x: torch.Tensor, alpha_det: torch.Tensor | float) -> torch.Tensor:
-    """Amplitude EMA detector (consistent with repo). x: (B,T)."""
-    alpha = torch.as_tensor(alpha_det, device=x.device, dtype=x.dtype)
-    return avg(x.abs(), alpha)
-
-
 def active_mask_from_env(env: torch.Tensor, thresh_db: float = -100.0) -> torch.Tensor:
     """Mask where envelope is above a floor (avoid counting deep silence)."""
     env_db = 20.0 * torch.log10(torch.clamp(env, min=10 ** (thresh_db / 20.0)))
