@@ -16,12 +16,13 @@ Design principles:
   replace the smoother with a custom op that reuses torchcomp's efficient backward.
 """
 
-import torch
 from typing import Optional, Dict, Union
+
 import numpy as np
+import torch
 from numba import njit, prange
 
-from differential_dynamics.benchmarks.bench_utilities import gain_db
+from differential_dynamics.benchmarks.bench_utilities import gain_db, np_gain_db_scalar
 from third_party.torchcomp_core.torchcomp import amp2db, db2amp, ms2coef, compexp_gain
 
 
@@ -90,16 +91,16 @@ def _var_alpha_smooth_sigmoid(
 @njit(parallel=True, fastmath=True)
 def _var_alpha_smooth_sigmoid_numba_core(
     gain_raw_linear: np.ndarray,  # (B, T) float32
-    alpha_a: np.ndarray,          # (B,)   float32
-    alpha_r: np.ndarray,          # (B,)   float32
-    k: float,                     # scalar
-    gate_db: bool,                # scalar
-    beta: float                   # scalar
+    alpha_a: np.ndarray,  # (B,)   float32
+    alpha_r: np.ndarray,  # (B,)   float32
+    k: float,  # scalar
+    gate_db: bool,  # scalar
+    beta: float,  # scalar
 ) -> np.ndarray:
     B, T = gain_raw_linear.shape
-    out = np.empty_like(gain_raw_linear)
+    y = np.empty_like(gain_raw_linear)
     eps = 1e-7
-    LN10_INV_20 = 8.685889638065036  # 20 / ln(10)
+    # use the same dB mapping as torch-side gain_db via a scalar helper
     for b in prange(B):
         prev = 1.0
         s_prev = 0.0
@@ -108,9 +109,7 @@ def _var_alpha_smooth_sigmoid_numba_core(
         for t in range(T):
             gt = gain_raw_linear[b, t]
             if gate_db:
-                gtn = gt if gt > eps else eps
-                prv = prev if prev > eps else eps
-                diff = LN10_INV_20 * (np.log(gtn) - np.log(prv))
+                diff = np_gain_db_scalar(gt) - np_gain_db_scalar(prev)
             else:
                 diff = gt - prev
             s = 1.0 / (1.0 + np.exp(-k * diff))
@@ -118,9 +117,9 @@ def _var_alpha_smooth_sigmoid_numba_core(
                 s = (1.0 - beta) * s_prev + beta * s
             alpha_t = s * a + (1.0 - s) * r
             prev = (1.0 - alpha_t) * prev + alpha_t * gt
-            out[b, t] = prev
+            y[b, t] = prev
             s_prev = s
-    return out
+    return y
 
 
 def _var_alpha_smooth_sigmoid_numba(
@@ -140,7 +139,9 @@ def _var_alpha_smooth_sigmoid_numba(
     a_np = alpha_a.detach().to(torch.float32).cpu().contiguous().numpy()
     r_np = alpha_r.detach().to(torch.float32).cpu().contiguous().numpy()
 
-    y_np = _var_alpha_smooth_sigmoid_numba_core(g_np, a_np, r_np, float(k), bool(gate_db), float(beta))
+    y_np = _var_alpha_smooth_sigmoid_numba_core(
+        g_np, a_np, r_np, float(k), bool(gate_db), float(beta)
+    )
     y = torch.from_numpy(y_np).to(gain_raw_linear.device, dtype=gain_raw_linear.dtype)
     return y
 
@@ -268,7 +269,8 @@ def compexp_gain_mode(
                 beta=beta,
             )
         else:
-            raise ValueError(f"Unknown smoother_backend: {smoother_backend}
-                             (expected 'torchscript' or 'numba')")
-
-    raise ValueError(f"Unknown ar_mode: {ar_mode}")
+            raise ValueError(
+                f"Unknown smoother_backend: {smoother_backend} (expected 'torchscript' or 'numba')"
+            )
+    else:
+        raise ValueError(f"Unknown ar_mode: {ar_mode}")
