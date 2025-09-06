@@ -1,6 +1,7 @@
+from typing import Union
+
 import torch
 import torch.nn.functional as F
-from typing import Union
 from torchlpc import sample_wise_lpc
 
 from .core import compressor_core
@@ -102,7 +103,7 @@ def compexp_gain(
     assert torch.all(rt > 0) and torch.all(rt < 1)
 
     comp_slope = 1 - 1 / comp_ratio  # slope in dB for the compressor branch
-    exp_slope = 1 - 1 / exp_ratio    # slope in dB for the expander branch
+    exp_slope = 1 - 1 / exp_ratio  # slope in dB for the expander branch
 
     log_x_rms = amp2db(x_rms)
     # Minimum of the two linear segments, then clamp positive parts to 0 dB.

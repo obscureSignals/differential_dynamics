@@ -78,7 +78,7 @@ def _var_alpha_smooth_sigmoid(
         s = torch.sigmoid(k * diff)
         if beta > 0.0:
             s = (1.0 - beta) * s_prev + beta * s
-        alpha_t = s * alpha_a + (1.0 - s) * alpha_r
+        alpha_t = s * alpha_r + (1.0 - s) * alpha_a
         prev_smoothed_gain = (
             1.0 - alpha_t
         ) * prev_smoothed_gain + alpha_t * gain_raw_linear_now
@@ -99,25 +99,27 @@ def _var_alpha_smooth_sigmoid_numba_core(
 ) -> np.ndarray:
     B, T = gain_raw_linear.shape
     y = np.empty_like(gain_raw_linear)
-    eps = 1e-7
-    # use the same dB mapping as torch-side gain_db via a scalar helper
     for b in prange(B):
-        prev = 1.0
+        prev_smoothed_gain = 1.0
         s_prev = 0.0
         a = alpha_a[b]
         r = alpha_r[b]
         for t in range(T):
-            gt = gain_raw_linear[b, t]
+            gain_raw_linear_now = gain_raw_linear[b, t]
             if gate_db:
-                diff = np_gain_db_scalar(gt) - np_gain_db_scalar(prev)
+                diff = np_gain_db_scalar(gain_raw_linear_now) - np_gain_db_scalar(
+                    prev_smoothed_gain
+                )
             else:
-                diff = gt - prev
+                diff = gain_raw_linear_now - prev_smoothed_gain
             s = 1.0 / (1.0 + np.exp(-k * diff))
             if beta > 0.0:
                 s = (1.0 - beta) * s_prev + beta * s
-            alpha_t = s * a + (1.0 - s) * r
-            prev = (1.0 - alpha_t) * prev + alpha_t * gt
-            y[b, t] = prev
+            alpha_t = s * r + (1.0 - s) * a
+            prev_smoothed_gain = (
+                1.0 - alpha_t
+            ) * prev_smoothed_gain + alpha_t * gain_raw_linear_now
+            y[b, t] = prev_smoothed_gain
             s_prev = s
     return y
 

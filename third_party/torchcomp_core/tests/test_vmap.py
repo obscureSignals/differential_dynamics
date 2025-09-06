@@ -1,9 +1,8 @@
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.func import jacfwd
-import pytest
 from torchcomp.core import compressor_core
-
 
 from .test_grad import create_test_inputs
 

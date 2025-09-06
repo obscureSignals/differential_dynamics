@@ -1,9 +1,10 @@
+from typing import Any, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+from numba import cuda, njit, prange
 from torch.autograd import Function
-import numpy as np
-from numba import njit, prange, cuda
-from typing import Tuple, Any, Optional, Callable
 from torchlpc import sample_wise_lpc
 
 
@@ -268,6 +269,7 @@ class CompressorFunction(Function):
     @staticmethod
     def vmap(info, in_dims, *args):
         """Vectorized mapping support for torch.func.vmap."""
+
         def maybe_expand_bdim_at_front(x, x_bdim):
             if x_bdim is None:
                 return x.expand(info.batch_size, *x.shape)
