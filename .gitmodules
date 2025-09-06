@@ -1,0 +1,3 @@
+[submodule "third_party/LA-2A"]
+	path = third_party/LA-2A
+	url = https://github.com/DiffAPF/LA-2A
