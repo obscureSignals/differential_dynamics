@@ -16,7 +16,7 @@ Design principles:
   replace the smoother with a custom op that reuses torchcomp's efficient backward.
 """
 
-from typing import Optional, Dict, Union
+from typing import Union
 
 import numpy as np
 import torch
@@ -31,9 +31,7 @@ def _var_alpha_smooth_sigmoid(
     gain_raw_linear: torch.Tensor,  # (B, T) target gain (linear)
     alpha_a: torch.Tensor,  # (B,) attack coeff in (0,1)
     alpha_r: torch.Tensor,  # (B,) release coeff in (0,1)
-    k: float,  # gate sharpness (linear or dB domain)
-    gate_db: bool,  # True to gate on dB gain difference
-    beta: float = 0.0,  # optional EMA on gate (0 disables)
+    k: float,  # gate sharpness
 ) -> torch.Tensor:
     """
     Variable-α one-pole smoother with a sigmoid gate on the gain trajectory.
@@ -44,15 +42,11 @@ def _var_alpha_smooth_sigmoid(
         y_t   = (1 - α_t) * y_{t-1} + α_t * g_tgt_t
 
     where diff_t is the difference between target gain and current smoothed gain.
-    If gate_db is True, diff is computed in dB (more stable near small values);
-    otherwise in linear domain.
 
     Args:
       gain_raw_linear: target gain g_tgt (B, T), linear scale in (0, 1].
       alpha_a, alpha_r: per-batch coefficients in (0,1) from ms2coef(at_ms/rt_ms).
       k: gate sharpness. Larger k sharpens the transition; calibrate via dB width.
-      gate_db: gate on dB difference when True; otherwise linear difference.
-      beta: optional EMA smoothing on the gate (0 disables), e.g., 0.1..0.3.
 
     Returns:
       y: smoothed gain (B, T), linear scale.
@@ -69,15 +63,9 @@ def _var_alpha_smooth_sigmoid(
     s_prev = torch.zeros(B, dtype=gain_raw_linear.dtype, device=gain_raw_linear.device)
     for t in range(T):
         gain_raw_linear_now = gain_raw_linear[:, t]
-        if gate_db:
-            # Gate on gain trajectory in dB
-            diff = gain_db(gain_raw_linear_now) - gain_db(prev_smoothed_gain)
-        else:
-            # Gate on linear difference
-            diff = gain_raw_linear_now - prev_smoothed_gain
+        # Gate on gain trajectory in dB
+        diff = gain_db(gain_raw_linear_now) - gain_db(prev_smoothed_gain)
         s = torch.sigmoid(k * diff)
-        if beta > 0.0:
-            s = (1.0 - beta) * s_prev + beta * s
         alpha_t = s * alpha_r + (1.0 - s) * alpha_a
         prev_smoothed_gain = (
             1.0 - alpha_t
@@ -94,8 +82,6 @@ def _var_alpha_smooth_sigmoid_numba_core(
     alpha_a: np.ndarray,  # (B,)   float32
     alpha_r: np.ndarray,  # (B,)   float32
     k: float,  # scalar
-    gate_db: bool,  # scalar
-    beta: float,  # scalar
 ) -> np.ndarray:
     B, T = gain_raw_linear.shape
     y = np.empty_like(gain_raw_linear)
@@ -106,15 +92,10 @@ def _var_alpha_smooth_sigmoid_numba_core(
         r = alpha_r[b]
         for t in range(T):
             gain_raw_linear_now = gain_raw_linear[b, t]
-            if gate_db:
-                diff = np_gain_db_scalar(gain_raw_linear_now) - np_gain_db_scalar(
-                    prev_smoothed_gain
-                )
-            else:
-                diff = gain_raw_linear_now - prev_smoothed_gain
+            diff = np_gain_db_scalar(gain_raw_linear_now) - np_gain_db_scalar(
+                prev_smoothed_gain
+            )
             s = 1.0 / (1.0 + np.exp(-k * diff))
-            if beta > 0.0:
-                s = (1.0 - beta) * s_prev + beta * s
             alpha_t = s * r + (1.0 - s) * a
             prev_smoothed_gain = (
                 1.0 - alpha_t
@@ -129,8 +110,6 @@ def _var_alpha_smooth_sigmoid_numba(
     alpha_a: torch.Tensor,
     alpha_r: torch.Tensor,
     k: float,
-    gate_db: bool,
-    beta: float = 0.0,
 ) -> torch.Tensor:
     """
     Numba-backed forward-only implementation of the sigmoid-gated variable-α smoother.
@@ -141,9 +120,7 @@ def _var_alpha_smooth_sigmoid_numba(
     a_np = alpha_a.detach().to(torch.float32).cpu().contiguous().numpy()
     r_np = alpha_r.detach().to(torch.float32).cpu().contiguous().numpy()
 
-    y_np = _var_alpha_smooth_sigmoid_numba_core(
-        g_np, a_np, r_np, float(k), bool(gate_db), float(beta)
-    )
+    y_np = _var_alpha_smooth_sigmoid_numba_core(g_np, a_np, r_np, float(k))
     y = torch.from_numpy(y_np).to(gain_raw_linear.device, dtype=gain_raw_linear.dtype)
     return y
 
@@ -158,7 +135,7 @@ def compexp_gain_mode(
     rt_ms: Union[torch.Tensor, float],
     fs: int,
     ar_mode: str = "hard",
-    gate_cfg: Optional[Dict[str, Union[float, bool]]] = None,
+    k: float = 1.0,
     smoother_backend: str = "torchscript",  # "torchscript" | "numba"
 ) -> torch.Tensor:
     """
@@ -179,10 +156,7 @@ def compexp_gain_mode(
       at_ms / rt_ms: attack/release times in milliseconds (10–90% convention).
       fs: sample rate.
       ar_mode: "hard" | "sigmoid" (more modes can be added).
-      gate_cfg: optional dict for gate parameters:
-        - k_db: float, gate sharpness in dB (≈ 4.4 / transition_width_dB)
-        - beta: float, gate EMA smoothing (0 disables)
-        - gate_db: bool, gate on dB difference when True
+      k: float, gate sharpness in dB (≈ 4.4 / transition_width_dB)
       smoother_backend: "torchscript" (default) for differentiable Torch smoother,
                         or "numba" for faster forward-only CPU recurrence.
 
@@ -239,36 +213,17 @@ def compexp_gain_mode(
     alpha_a = ms2coef(torch.as_tensor(at_ms, device=dev, dtype=dt), fs).expand(B)
     alpha_r = ms2coef(torch.as_tensor(rt_ms, device=dev, dtype=dt), fs).expand(B)
 
-    # Gate configuration with sensible defaults; can be overridden via gate_cfg
-    k_db = 2.0
-    beta = 0.0
-    gate_db = True
-    if gate_cfg is not None:
-        if "k_db" in gate_cfg and gate_cfg["k_db"] is not None:
-            k_db = float(gate_cfg["k_db"])  # approximate 4.4 / width_dB
-        if "beta" in gate_cfg and gate_cfg["beta"] is not None:
-            beta = float(gate_cfg["beta"])  # small gate smoothing (0.0..0.3)
-        if "gate_db" in gate_cfg and gate_cfg["gate_db"] is not None:
-            gate_db = bool(gate_cfg["gate_db"])  # True to gate in dB domain
-
     if ar_mode == "sigmoid":
         if smoother_backend == "torchscript":
             return _var_alpha_smooth_sigmoid(
-                gain_raw_linear=gain_raw_linear,
-                alpha_a=alpha_a,
-                alpha_r=alpha_r,
-                k=k_db,
-                gate_db=gate_db,
-                beta=beta,
+                gain_raw_linear=gain_raw_linear, alpha_a=alpha_a, alpha_r=alpha_r, k=k
             )
         elif smoother_backend == "numba":
             return _var_alpha_smooth_sigmoid_numba(
                 gain_raw_linear=gain_raw_linear,
                 alpha_a=alpha_a,
                 alpha_r=alpha_r,
-                k=k_db,
-                gate_db=gate_db,
-                beta=beta,
+                k=k,
             )
         else:
             raise ValueError(

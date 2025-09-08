@@ -62,14 +62,15 @@ High-level architecture
 
 - Differential gain core (PyTorch backend)
   - File: differential_dynamics/backends/torch/gain.py
-  - Entry: compexp_gain_mode(x_rms, comp_thresh, comp_ratio, exp_thresh, exp_ratio, at_ms, rt_ms, fs, ar_mode, gate_cfg, smoother_backend)
+  - Entry: compexp_gain_mode(x_rms, comp_thresh, comp_ratio, exp_thresh, exp_ratio, at_ms, rt_ms, fs, ar_mode, smoother_backend)
   - Purpose: Computes compressor/expander gain traces with identical detector semantics and static dB curve to the baseline (torchcomp), while swapping only the attack/release gating and smoothing policy.
   - Modes and backends:
     - ar_mode="hard": delegates entirely to third_party.torchcomp_core.torchcomp.compexp_gain to preserve exact baseline behavior and custom backward.
-    - ar_mode="sigmoid": uses a TorchScript loop or a Numba kernel to implement a differentiable, gate-blended one-pole smoother. Gate can operate in linear or dB domain, with optional EMA on the gate.
+    - ar_mode="sigmoid": uses a TorchScript loop or a Numba kernel to implement a differentiable, gate-blended one-pole smoother. Gate operates in the dB domain; k_db controls sharpness. No beta smoothing.
   - Key invariants:
     - Static curve is computed in dB and clamped to never exceed 0 dB (only reduce or keep unity gain), matching torchcomp.
     - Time constants (ms2coef) use the 10–90% convention across implementations.
+  - Near-term plan: simplify API to expose k_db directly (CLI flag) and remove gate_cfg/beta; dB-domain gating is standard.
 
 - Baseline (classical compressor/expander)
   - File: differential_dynamics/baselines/classical_compressor.py

@@ -40,6 +40,7 @@ with torch.no_grad():
         exp_ratio: float = 1.0,
         attack_time_ms: float = 10.0,
         release_time_ms: float = 100.0,
+        k: float = 1.0,
     ):
 
         if test_signal_type == "file":
@@ -108,7 +109,6 @@ with torch.no_grad():
         # )
 
         # Variant B: sigmoid gating envelope + same static curve (forward-only)
-        gate_cfg = {"k_db": 1, "beta": 0, "gate_db": True}
         g_sigmoid = compexp_gain_mode(
             x_rms=test_signal_rms.clamp_min(1e-7),
             comp_thresh=comp_thresh,
@@ -119,7 +119,7 @@ with torch.no_grad():
             rt_ms=release_time_ms,
             fs=fs,
             ar_mode="sigmoid",
-            gate_cfg=gate_cfg,
+            k=k,
             smoother_backend="numba",
         )
 
@@ -249,6 +249,12 @@ if __name__ == "__main__":
     p.add_argument(
         "--release-time-ms", type=float, default=100.0, help="Release time in ms"
     )
+    p.add_argument(
+        "--k",
+        type=float,
+        default=1.0,
+        help="Multiplier for diff in sigmoid gating (higher = harder)",
+    )
 
     args = p.parse_args()
 
@@ -269,4 +275,5 @@ if __name__ == "__main__":
         exp_ratio=args.exp_ratio,
         attack_time_ms=args.attack_time_ms,
         release_time_ms=args.release_time_ms,
+        k=args.k,
     )

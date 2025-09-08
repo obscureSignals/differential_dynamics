@@ -38,9 +38,9 @@ class ClassicalCompressor:
         self.at = ms2coef(torch.as_tensor(attack_time_ms), fs)
         self.rt = ms2coef(torch.as_tensor(release_time_ms), fs)
 
-        assert comp_ratio > 1
+        assert comp_ratio >= 1
         # exp_ratio < 1 corresponds to downward expansion below exp_thresh.
-        assert 1 > exp_ratio > 0
+        assert 1 >= exp_ratio > 0
         assert 0 < self.at < 1
         assert 0 < self.rt < 1
 
@@ -122,6 +122,7 @@ class ClassicalCompressor:
         gains = self.classical_compexp_gain(x_rms)
         # apply gains to input signal and return
         return gains * x
+
 
 @njit(parallel=True, fastmath=True)
 def ar_smooth_numba_core(gain_raw_linear, at, rt):
