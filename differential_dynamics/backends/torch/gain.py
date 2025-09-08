@@ -131,64 +131,50 @@ def compexp_gain_mode(
     comp_ratio: Union[torch.Tensor, float],
     exp_thresh: Union[torch.Tensor, float],
     exp_ratio: Union[torch.Tensor, float],
-    at_ms: Union[torch.Tensor, float],
-    rt_ms: Union[torch.Tensor, float],
-    fs: int,
+    alpha_a: Union[torch.Tensor, float],
+    alpha_r: Union[torch.Tensor, float],
     ar_mode: str = "hard",
     k: float = 1.0,
     smoother_backend: str = "torchscript",  # "torchscript" | "numba"
 ) -> torch.Tensor:
     """
-    Switchable compressor/expander gain function.
+    Switchable compressor/expander gain function using attack/release coefficients.
 
     This keeps the detector semantics and the dB static curve identical to
     torchcomp and swaps only the A/R gating/smoothing policy via `ar_mode`.
 
     Modes:
-      - "hard": delegates entirely to torchcomp.compexp_gain (baseline; preserves backward)
+      - "hard": delegates to torchcomp.compexp_gain (baseline; preserves backward)
       - "sigmoid": smooth gate between attack/release based on gain trajectory
 
-    Args (mirror torchcomp.compexp_gain):
+    Args:
       x_rms: (B, T) non-negative detector signal (e.g., amplitude EMA of |x|).
       comp_thresh / exp_thresh: thresholds in dB.
       comp_ratio: > 1 (downward compression above comp_thresh).
       exp_ratio: in (0,1) (downward expansion below exp_thresh).
-      at_ms / rt_ms: attack/release times in milliseconds (10–90% convention).
-      fs: sample rate.
-      ar_mode: "hard" | "sigmoid" (more modes can be added).
-      k: float, gate sharpness in dB (≈ 4.4 / transition_width_dB)
-      smoother_backend: "torchscript" (default) for differentiable Torch smoother,
-                        or "numba" for faster forward-only CPU recurrence.
+      alpha_a / alpha_r: attack/release one-pole coefficients in (0,1).
+      ar_mode: "hard" | "sigmoid".
+      k: float, gate sharpness for sigmoid mode.
+      smoother_backend: "torchscript" (default) or "numba" (forward-only CPU).
 
     Returns:
       (B, T) linear gain to apply to the signal.
-
-    Notes:
-      - The hard mode calls torchcomp directly, ensuring identical baseline
-        behavior and backward.
-      - Non-hard modes compute the same static curve and apply a TorchScript
-        smoother for forward benchmarking (fully differentiable).
     """
+    B, T = x_rms.shape
+    dev, dt = x_rms.device, x_rms.dtype
+
     if ar_mode == "hard":
-        # Delegate entirely to torchcomp baseline (identical static curve + smoother,
-        # and preserves its custom backward). This is the exact reference.
-        at = ms2coef(torch.as_tensor(at_ms), fs)
-        rt = ms2coef(torch.as_tensor(rt_ms), fs)
         return compexp_gain(
             x_rms=x_rms,
             comp_thresh=comp_thresh,
             comp_ratio=comp_ratio,
             exp_thresh=exp_thresh,
             exp_ratio=exp_ratio,
-            at=at,
-            rt=rt,
+            at=torch.as_tensor(alpha_a, device=dev, dtype=dt).expand(B),
+            rt=torch.as_tensor(alpha_r, device=dev, dtype=dt).expand(B),
         )
 
-    # Compute the static curve exactly like torchcomp (dB domain + clamping):
-    #   g_db = min(comp_slope*(CT - L), exp_slope*(ET - L)).neg().relu().neg()
-    # This ensures we only reduce or keep unity gain (<= 0 dB).
-    B, T = x_rms.shape
-    dev, dt = x_rms.device, x_rms.dtype
+    # Compute static curve in dB with clamping (identical to torchcomp)
     comp_thresh_t = torch.as_tensor(comp_thresh, device=dev, dtype=dt).expand(B)
     exp_thresh_t = torch.as_tensor(exp_thresh, device=dev, dtype=dt).expand(B)
     comp_ratio_t = torch.as_tensor(comp_ratio, device=dev, dtype=dt).expand(B)
@@ -209,20 +195,19 @@ def compexp_gain_mode(
     )
     gain_raw_linear = db2amp(gain_raw_db)
 
-    # Time constants: convert ms -> one-pole coefficients (10–90% convention)
-    alpha_a = ms2coef(torch.as_tensor(at_ms, device=dev, dtype=dt), fs).expand(B)
-    alpha_r = ms2coef(torch.as_tensor(rt_ms, device=dev, dtype=dt), fs).expand(B)
+    alpha_a_t = torch.as_tensor(alpha_a, device=dev, dtype=dt).expand(B)
+    alpha_r_t = torch.as_tensor(alpha_r, device=dev, dtype=dt).expand(B)
 
     if ar_mode == "sigmoid":
         if smoother_backend == "torchscript":
             return _var_alpha_smooth_sigmoid(
-                gain_raw_linear=gain_raw_linear, alpha_a=alpha_a, alpha_r=alpha_r, k=k
+                gain_raw_linear=gain_raw_linear, alpha_a=alpha_a_t, alpha_r=alpha_r_t, k=k
             )
         elif smoother_backend == "numba":
             return _var_alpha_smooth_sigmoid_numba(
                 gain_raw_linear=gain_raw_linear,
-                alpha_a=alpha_a,
-                alpha_r=alpha_r,
+                alpha_a=alpha_a_t,
+                alpha_r=alpha_r_t,
                 k=k,
             )
         else:

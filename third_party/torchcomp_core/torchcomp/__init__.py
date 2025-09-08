@@ -98,7 +98,7 @@ def compexp_gain(
     assert torch.all(x_rms > 0)
     assert torch.all(comp_ratio > 1)
     # exp_ratio < 1 corresponds to downward expansion below exp_thresh.
-    assert torch.all(exp_ratio < 1) and torch.all(exp_ratio > 0)
+    assert torch.all(exp_ratio <= 1) and torch.all(exp_ratio > 0)
     assert torch.all(at > 0) and torch.all(at < 1)
     assert torch.all(rt > 0) and torch.all(rt < 1)
 

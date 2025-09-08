@@ -20,7 +20,9 @@ Optional musical clips are cropped from --music-dir.
 """
 
 import argparse
+import os.path
 import random
+from argparse import ArgumentError
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Tuple
@@ -29,6 +31,9 @@ import math
 import torch
 import torchaudio
 import yaml
+import logging
+import matplotlib.pyplot as plt
+import sounddevice as sd
 
 from differential_dynamics.baselines.classical_compressor import ClassicalCompressor
 from differential_dynamics.benchmarks.bench_utilities import ema_1pole_lfilter
@@ -40,6 +45,14 @@ from differential_dynamics.benchmarks.signals import (
     composite_program,
 )
 from third_party.torchcomp_core.torchcomp import ms2coef
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -205,7 +218,9 @@ def list_music_files(music_dir: Path) -> list[Path]:
     return paths
 
 
-def allocate_music_files(files: list[Path], split_pcts: tuple[float, float, float], seed: int) -> dict[str, list[Path]]:
+def allocate_music_files(
+    files: list[Path], split_pcts: tuple[float, float, float], seed: int
+) -> dict[str, list[Path]]:
     """Shuffle files and allocate disjoint sets to train/val/test by percentages."""
     rng = random.Random(seed)
     files = files.copy()
@@ -273,33 +288,100 @@ def main():
     p = argparse.ArgumentParser(
         description="Build train/val/test datasets with hard-gate teacher targets (compression-only)"
     )
-    p.add_argument("--output-dir", type=str, required=True, help="Root directory to write processed/{split}/perm_XXX/clip_XXXX")
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Root directory to write processed/{split}/perm_XXX/clip_XXXX",
+    )
     p.add_argument("--fs", type=int, default=44100, help="Sample rate (Hz)")
-    p.add_argument("--detector-ms", type=float, default=20.0, help="Detector EMA time constant (ms)")
-    p.add_argument("--clip-dur-s", type=float, default=2.0, help="Clip duration in seconds")
+    p.add_argument(
+        "--detector-ms",
+        type=float,
+        default=20.0,
+        help="Detector EMA time constant (ms)",
+    )
+    p.add_argument(
+        "--clip-dur-s", type=float, default=2, help="Clip duration in seconds"
+    )
 
     # Seeds: separate θ from content to avoid leakage while keeping θ fixed per perm across splits
-    p.add_argument("--theta-seed", type=int, default=1337, help="Seed to sample theta per permutation deterministically")
-    p.add_argument("--seed-train", type=int, default=1001, help="RNG seed for train signal generation/crops")
-    p.add_argument("--seed-val", type=int, default=1002, help="RNG seed for val signal generation/crops")
-    p.add_argument("--seed-test", type=int, default=1003, help="RNG seed for test signal generation/crops")
-    p.add_argument("--music-split-seed", type=int, default=2024, help="Seed to allocate music files into disjoint splits")
+    p.add_argument(
+        "--theta-seed",
+        type=int,
+        default=1337,
+        help="Seed to sample theta per permutation deterministically",
+    )
+    p.add_argument(
+        "--seed-train",
+        type=int,
+        default=1001,
+        help="RNG seed for train signal generation/crops",
+    )
+    p.add_argument(
+        "--seed-val",
+        type=int,
+        default=1002,
+        help="RNG seed for val signal generation/crops",
+    )
+    p.add_argument(
+        "--seed-test",
+        type=int,
+        default=1003,
+        help="RNG seed for test signal generation/crops",
+    )
+    p.add_argument(
+        "--music-split-seed",
+        type=int,
+        default=2024,
+        help="Seed to allocate music files into disjoint splits",
+    )
 
     # Music
-    p.add_argument("--music-dir", type=str, default=None, help="Directory containing musical audio files (files will be split by file into train/val/test)")
-    p.add_argument("--music-frac", type=float, default=0.5, help="Fraction of clips per split to source from music (rest from synthetic)")
+    p.add_argument(
+        "--music-dir",
+        type=str,
+        default=None,
+        help="Directory containing musical audio files (files will be split by file into train/val/test)",
+    )
+    p.add_argument(
+        "--music-frac",
+        type=float,
+        default=0.5,
+        help="Fraction of clips per split to source from music (rest from synthetic)",
+    )
 
     # Totals and split percentages
-    p.add_argument("--num-total", type=int, default=120, help="Total clips per split (train/val/test)")
-    p.add_argument("--split-pcts", type=str, default="80,10,10", help="Percent split for train,val,test (e.g., 80,10,10)")
+    p.add_argument(
+        "--num-total",
+        type=int,
+        default=120,
+        help="Total clips per split (train/val/test)",
+    )
+    p.add_argument(
+        "--split-pcts",
+        type=str,
+        default="80,10,10",
+        help="Percent split for train,val,test (e.g., 80,10,10)",
+    )
 
     # Permutations: number of global-theta datasets to create
-    p.add_argument("--num-perms", type=int, default=1, help="How many parameter permutations to generate; each permutation shares the same clips within a split but uses a single random theta for all clips")
+    p.add_argument(
+        "--num-perms",
+        type=int,
+        default=1,
+        help="How many parameter permutations to generate; each permutation shares the same clips within a split but uses a single random theta for all clips",
+    )
 
     args = p.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not (0 <= args.music_frac <= 1):
+        raise ArgumentError(
+            f"music_frac = {args.music_frac}, but must be between 0 and 1"
+        )
 
     split_pcts = parse_split_pcts(args.split_pcts)
     # Per split counts
@@ -313,7 +395,9 @@ def main():
     files_by_split: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
     if args.music_dir is not None:
         all_files = list_music_files(Path(args.music_dir))
-        files_by_split = allocate_music_files(all_files, split_pcts, args.music_split_seed)
+        files_by_split = allocate_music_files(
+            all_files, split_pcts, args.music_split_seed
+        )
 
     # Build content per split (disjoint via per-split seeds)
     def build_split_items(split: str, seed: int) -> list[Tuple[torch.Tensor, int, str]]:
@@ -332,7 +416,9 @@ def main():
         items: list[Tuple[torch.Tensor, int, str]] = []
         # Music crops
         if args.music_dir is not None and files_by_split[split]:
-            crops = random_music_crops(files_by_split[split], args.fs, args.clip_dur_s, n_music, seed)
+            crops = random_music_crops(
+                files_by_split[split], args.fs, args.clip_dur_s, n_music, seed
+            )
             items.extend([(clip, args.fs, f"music:{src}") for (clip, _, src) in crops])
         # If not enough music, fill deficit with synthetic
         if len(items) < n_music:
@@ -384,7 +470,11 @@ def main():
                     theta,
                     fs,
                     args.detector_ms,
-                    seed={"train": args.seed_train, "val": args.seed_val, "test": args.seed_test}[split_name],
+                    seed={
+                        "train": args.seed_train,
+                        "val": args.seed_val,
+                        "test": args.seed_test,
+                    }[split_name],
                 )
             print(
                 f"Wrote {split_sub} with CT={theta.comp_thresh_db:.1f}dB CR={theta.comp_ratio:.1f} AT={theta.attack_ms:.1f}ms RT={theta.release_ms:.1f}ms (clips: {len(items)})"

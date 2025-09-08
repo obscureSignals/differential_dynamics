@@ -115,9 +115,22 @@ with torch.no_grad():
             comp_ratio=comp_ratio,
             exp_thresh=exp_thresh,
             exp_ratio=exp_ratio,
-            at_ms=attack_time_ms,
-            rt_ms=release_time_ms,
-            fs=fs,
+            alpha_a=ms2coef(
+                torch.as_tensor(
+                    attack_time_ms,
+                    device=test_signal_rms.device,
+                    dtype=test_signal_rms.dtype,
+                ),
+                fs,
+            ),
+            alpha_r=ms2coef(
+                torch.as_tensor(
+                    release_time_ms,
+                    device=test_signal_rms.device,
+                    dtype=test_signal_rms.dtype,
+                ),
+                fs,
+            ),
             ar_mode="sigmoid",
             k=k,
             smoother_backend="numba",
