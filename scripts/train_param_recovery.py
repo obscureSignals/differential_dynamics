@@ -26,9 +26,9 @@ from pathlib import Path
 from typing import Dict, List
 
 import torch
-from torch.utils.data import Dataset, DataLoader
 import torchaudio
 import yaml
+from torch.utils.data import Dataset, DataLoader
 
 from differential_dynamics.benchmarks.bench_utilities import (
     rmse_db,
@@ -38,6 +38,17 @@ from differential_dynamics.training.param_recovery_model import (
     GlobalParamModel,
     linear_anneal,
 )
+
+
+def _safe_rmse_db(
+    g_ref: torch.Tensor, g_pred: torch.Tensor, mask: torch.Tensor | None
+) -> torch.Tensor:
+    """RMSE dB that falls back to unmasked when mask is empty to avoid NaNs."""
+    if mask is not None:
+        # If mask reduces all elements away, mean() would be NaN; guard it.
+        if mask.numel() == 0 or torch.count_nonzero(mask) == 0:
+            return rmse_db(g_ref, g_pred, mask=None)
+    return rmse_db(g_ref, g_pred, mask=mask)
 
 
 def load_yaml(path: Path) -> Dict:
@@ -118,9 +129,59 @@ def evaluate(
                 g_pred = model(x_rms, ar_mode="sigmoid", k=k_val)
             else:
                 g_pred = model(x_rms, ar_mode="hard")
-            loss = rmse_db(g_ref, g_pred, mask=mask)
+            loss = _safe_rmse_db(g_ref, g_pred, mask=mask)
             losses.append(loss.item())
     return float(sum(losses) / max(1, len(losses)))
+
+
+def summarize_target_params(loader: DataLoader) -> Dict[str, float | int | list]:
+    """Extract target theta from dataset metadata.
+    If multiple unique thetas are found, report count and the first as exemplar.
+    """
+    # Collect a few samples to determine uniqueness
+    thetas: List[Dict] = []
+    for i, batch in enumerate(loader):
+        # theta_ref is a list of dicts (one per item in batch)
+        thetas.extend(batch["theta_ref"])  # type: ignore[index]
+        if len(thetas) >= 32:  # sample up to 32 items
+            break
+
+    # Normalize and dedup by tuple
+    def norm(d: Dict) -> Dict[str, float]:
+        return {
+            "comp_thresh_db": float(
+                d.get("comp_thresh_db", d.get("CT", d.get("comp_thresh", 0.0)))
+            ),
+            "comp_ratio": float(d.get("comp_ratio", d.get("CR", d.get("ratio", 0.0)))),
+            "attack_ms": float(
+                d.get("attack_ms", d.get("AT_MS", d.get("attack_time_ms", 0.0)))
+            ),
+            "release_ms": float(
+                d.get("release_ms", d.get("RT_MS", d.get("release_time_ms", 0.0)))
+            ),
+        }
+
+    thetas_n = [norm(t) for t in thetas]
+    # Deduplicate
+    keys = [tuple(t.items()) for t in thetas_n]
+    unique = []
+    seen = set()
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            unique.append(dict(k))
+    summary: Dict[str, float | int | list] = {}
+    summary["num_unique_target_param_sets"] = len(unique)
+    if unique:
+        summary["target_params"] = unique[0]
+    else:
+        summary["target_params"] = {
+            "comp_thresh_db": None,
+            "comp_ratio": None,
+            "attack_ms": None,
+            "release_ms": None,
+        }
+    return summary
 
 
 def main():
@@ -140,7 +201,7 @@ def main():
     p.add_argument(
         "--early-stop-patience",
         type=int,
-        default=10,
+        default=100,
         help="Number of epochs with no val improvement before stopping",
     )
     p.add_argument(
@@ -153,19 +214,19 @@ def main():
     p.add_argument(
         "--k-start",
         type=float,
-        default=0.5,
+        default=0.1,
         help="Initial k (sigmoid sharpness), only used in sigmoid mode",
     )
     p.add_argument(
         "--k-end",
         type=float,
-        default=2.0,
+        default=50.0,
         help="Final k for linear annealing, only used in sigmoid mode",
     )
     p.add_argument(
         "--k-anneal-steps",
         type=int,
-        default=1000,
+        default=50.0,
         help="Steps over which to anneal k from start to end",
     )
     args = p.parse_args()
@@ -199,6 +260,7 @@ def main():
 
     best_val = float("inf")
     best_state = None
+    best_val_k = None  # k used during best val (sigmoid only)
     patience_left = args.early_stop_patience
     global_step = 0
 
@@ -218,7 +280,7 @@ def main():
             else:
                 g_pred = model(x_rms, ar_mode="hard")
 
-            loss = rmse_db(g_ref, g_pred, mask=mask)
+            loss = _safe_rmse_db(g_ref, g_pred, mask=mask)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -250,6 +312,7 @@ def main():
             best_state = {
                 k: v.detach().cpu().clone() for k, v in model.state_dict().items()
             }
+            best_val_k = float(k_eval) if args.ar_mode == "sigmoid" else None
             patience_left = args.early_stop_patience
         else:
             patience_left -= 1
@@ -259,20 +322,65 @@ def main():
                 )
                 break
 
-    # Restore best state if available
+    # Restore best state if available; otherwise keep current params
     if best_state is not None:
         model.load_state_dict(best_state)
+    # Ensure k_at_best_val is defined for sigmoid when val never improved
+    if args.ar_mode == "sigmoid" and best_val_k is None:
+        mid_step = (args.k_anneal_steps // 2) if args.k_anneal_steps > 0 else 0
+        best_val_k = linear_anneal(
+            args.k_start, args.k_end, mid_step, args.k_anneal_steps
+        )
 
-    # Evaluate on test (use final k_end for sigmoid)
-    k_test = args.k_end if args.ar_mode == "sigmoid" else None
-    test_loss = evaluate(model, test_loader, device, args.ar_mode, k_test)
+    # Evaluate on test using best params
+    if args.ar_mode == "sigmoid":
+        # Test with k at best val (mid-anneal), final k, and hard gate
+        test_loss_best = evaluate(model, test_loader, device, "sigmoid", best_val_k)
+        test_loss_final_k = evaluate(model, test_loader, device, "sigmoid", args.k_end)
+        test_loss_hard = evaluate(model, test_loader, device, "hard", None)
+        k_best_display = float(best_val_k) if best_val_k is not None else None
+        # For compatibility with previous print, set test_loss to final_k
+        test_loss = test_loss_final_k
+    else:
+        test_loss_best = evaluate(model, test_loader, device, "hard", None)
+        test_loss_final_k = None
+        test_loss_hard = test_loss_best
+        k_best_display = None
+        test_loss = test_loss_best
+
     print(f"test_rmse_db={test_loss:.4f}")
 
-    # Save final (best) params for inspection
-    out_path = root / f"final_params_{args.ar_mode}.yaml"
-    with open(out_path, "w") as f:
-        yaml.safe_dump(model.params_readable(), f)
-    print(f"Saved final params to {out_path}")
+    # Prepare summary
+    target_summary = summarize_target_params(train_loader)
+    best_params = model.params_readable()
+    summary = {
+        "ar_mode": args.ar_mode,
+        "best_val_rmse_db": float(best_val),
+        "k_at_best_val": k_best_display,
+        "test_rmse_db_best_params": float(test_loss_best),
+        "test_rmse_db_best_params_final_k": (
+            float(test_loss_final_k) if test_loss_final_k is not None else None
+        ),
+        "test_rmse_db_best_params_hard": float(test_loss_hard),
+        "test_rmse_db": float(test_loss),
+        "target": target_summary,
+        "best_params": best_params,
+    }
+
+    # Print summary
+    print("==== Training summary ====")
+    for k, v in summary.items():
+        print(f"{k}: {v}")
+
+    # Save params and summary
+    out_params = root / f"final_params_{args.ar_mode}.yaml"
+    with open(out_params, "w") as f:
+        yaml.safe_dump(best_params, f)
+    out_summary = root / f"summary_{args.ar_mode}.yaml"
+    with open(out_summary, "w") as f:
+        yaml.safe_dump(summary, f, sort_keys=True)
+    print(f"Saved final params to {out_params}")
+    print(f"Saved summary to {out_summary}")
 
 
 if __name__ == "__main__":

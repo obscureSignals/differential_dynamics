@@ -8,18 +8,11 @@ import matplotlib.pyplot as plt
 import torch
 import torchaudio
 
-from differential_dynamics.backends.torch.gain import compexp_gain_mode
-from differential_dynamics.baselines.classical_compressor import ClassicalCompressor
+from differential_dynamics.backends.torch.gain import SSL_comp_gain
 from differential_dynamics.benchmarks.bench_utilities import (
-    active_mask_from_env,
-    rmse_db,
-    ema_1pole_lfilter,
     gain_db,
 )
 from differential_dynamics.benchmarks.signals import step, tone, burst, ramp
-from third_party.torchcomp_core.torchcomp import (
-    ms2coef,
-)
 
 # Configure logging
 logging.basicConfig(
@@ -36,10 +29,10 @@ with torch.no_grad():
         test_file_path: str = None,
         comp_thresh: Union[float, str] = -24.0,
         comp_ratio: float = 4.0,
-        exp_thresh: float = -1000.0,
-        exp_ratio: float = 1.0,
-        attack_time_ms: float = 10.0,
-        release_time_ms: float = 100.0,
+        attack_time_fast_ms: float = 10.0,
+        attack_time_slow_ms: float = 10.0,
+        release_time_fast_ms: float = 100.0,
+        release_time_slow_ms: float = 100.0,
         k: float = 1.0,
     ):
 
@@ -73,105 +66,52 @@ with torch.no_grad():
             else:
                 raise ValueError(f"Unknown test signal type: {test_signal_type}")
 
-        # Use the same detector for all compressors
-        detector_time_ms = torch.tensor(20.0)  # time constant for detector in ms
-        alpha_det = ms2coef(detector_time_ms, fs)  # convert to coefficient
-        test_signal_rms = ema_1pole_lfilter(test_signal.abs(), alpha_det)
-        test_signal_rms = test_signal_rms.clamp_min(1e-7)  # avoid log(0) issues
+        test_signal_peak_dB = gain_db(test_signal.abs())
 
         # Set compressor threshold to mean input level if 'auto'
         if isinstance(comp_thresh, str) and comp_thresh.lower() == "auto":
-            comp_thresh = torch.mean(gain_db(test_signal_rms))
+            comp_thresh = torch.mean(test_signal_peak_dB)
 
-        # Classical baseline
-        comp = ClassicalCompressor(
-            comp_thresh=comp_thresh,
-            comp_ratio=comp_ratio,
-            exp_thresh=exp_thresh,
-            exp_ratio=exp_ratio,
-            attack_time_ms=attack_time_ms,
-            release_time_ms=release_time_ms,
-            fs=fs,
-            detector_time_ms=detector_time_ms,
-        )
-
-        g_classical = comp.classical_compexp_gain(test_signal_rms)
-
-        # # Variant A: torchcomp gain (hard A/R), same detector
-        # g_hard = compexp_gain(
-        #     x_rms=test_signal_rms.clamp_min(1e-7),
+        # # Classical baseline
+        # comp = ClassicalCompressor(
         #     comp_thresh=comp_thresh,
         #     comp_ratio=comp_ratio,
         #     exp_thresh=exp_thresh,
         #     exp_ratio=exp_ratio,
-        #     at=ms2coef(torch.tensor(attack_time_ms), fs),
-        #     rt=ms2coef(torch.tensor(release_time_ms), fs),
+        #     attack_time_ms=attack_time_ms,
+        #     release_time_ms=release_time_ms,
+        #     fs=fs,
+        #     detector_time_ms=detector_time_ms,
         # )
 
-        # Variant B: sigmoid gating envelope + same static curve (forward-only)
-        g_sigmoid = compexp_gain_mode(
-            x_rms=test_signal_rms.clamp_min(1e-7),
+        # g_classical = comp.classical_compexp_gain(test_signal_rms)
+
+        g_SSL = SSL_comp_gain(
+            x_peak_dB=test_signal_peak_dB,
             comp_thresh=comp_thresh,
             comp_ratio=comp_ratio,
-            exp_thresh=exp_thresh,
-            exp_ratio=exp_ratio,
-            alpha_a=ms2coef(
-                torch.as_tensor(
-                    attack_time_ms,
-                    device=test_signal_rms.device,
-                    dtype=test_signal_rms.dtype,
-                ),
-                fs,
-            ),
-            alpha_r=ms2coef(
-                torch.as_tensor(
-                    release_time_ms,
-                    device=test_signal_rms.device,
-                    dtype=test_signal_rms.dtype,
-                ),
-                fs,
-            ),
-            ar_mode="sigmoid",
+            T_attack_fast=attack_time_fast_ms / 1000,
+            T_attack_slow=attack_time_slow_ms / 1000,
+            T_shunt_fast=release_time_fast_ms / 1000,
+            T_shunt_slow=release_time_slow_ms / 1000,
+            fs=fs,
             k=k,
-            smoother_backend="numba",
         )
-
-        # Metrics (primary: gain RMSE dB on active regions)
-        mask = active_mask_from_env(test_signal_rms, thresh_db=-100.0)
-        # m_hard = rmse_db(g_classical, g_hard, mask=mask)
-        m_sig = rmse_db(g_classical, g_sigmoid, mask=mask)
-        # print(
-        #     f"Gain RMSE dB — hard: {m_hard.item():.3f} dB, sigmoid: {m_sig.item():.3f} dB"
-        # )
-        print(f"Gain RMSE dB — sigmoid: {m_sig.item():.3f} dB")
 
         # Plot gain traces
         t = torch.arange(T) / fs
-        gd_classical = 20 * torch.log10(g_classical.clamp_min(1e-7))[0].cpu()
-        # gd_hard = 20 * torch.log10(g_hard.clamp_min(1e-7))[0].cpu()
-        gd_sig = 20 * torch.log10(g_sigmoid.clamp_min(1e-7))[0].cpu()
-        input_env = 20 * torch.log10(test_signal_rms.clamp_min(1e-7))[0].cpu()
 
         plt.figure(figsize=(10, 5))
-        plt.plot(t, gd_classical, label="Classical")
-        # plt.plot(t, gd_hard, "--", label="hard")
-        plt.plot(t, gd_sig, label="Sigmoid")
-        plt.plot(t, input_env, label="Test Signal Envelope", alpha=0.3)
-        # plt.plot(t, test_signal.squeeze(), label="input signal", alpha=0.3)
+        plt.plot(t, test_signal_peak_dB.squeeze(), label="Input")
+        # plt.plot(t, test_signal_peak_dB.squeeze() + g_SSL.squeeze(), label="Output")
+        plt.plot(t, g_SSL.squeeze(), label="Gain")
 
         plt.axhline(y=comp_thresh, linestyle="--", label="Threshold")
-        # plt.text(0, comp_thresh - 2, "Threshold")
-        plt.text(
-            T / (2 * fs),
-            -36,
-            f"Gain RMSE: {m_sig.item():.3f} dB",
-            horizontalalignment="center",
-        )
+
         plt.xlabel("time (s)")
-        plt.ylabel("gain (dB)")
+        plt.ylabel("dB")
         plt.legend()
         plt.grid(True)
-        plt.title("Gain traces")
         plt.ylim(-40.0, 6.0)
         plt.tight_layout()
         plt.show()
@@ -234,9 +174,7 @@ def float_or_auto(value):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(
-        description="Benchmark differentiable vs classical compressor"
-    )
+    p = argparse.ArgumentParser(description="Test SSL Forward")
     p.add_argument(
         "--test-signal-type",
         type=str,
@@ -253,14 +191,28 @@ if __name__ == "__main__":
     )
     p.add_argument("--comp-ratio", type=float, default=4.0, help="Compressor ratio")
     p.add_argument(
-        "--exp-thresh", type=float, default=-1000.0, help="Expander threshold in dB"
+        "--attack-time-fast-ms",
+        type=float,
+        default=820 * 0.47e-6 * 1000,
+        help="Fast attack time in ms",
     )
-    p.add_argument("--exp-ratio", type=float, default=0.5, help="Expander ratio")
     p.add_argument(
-        "--attack-time-ms", type=float, default=10.0, help="Attack time in ms"
+        "--attack-time-slow-ms",
+        type=float,
+        default=820 * 6.8e-6 * 1000,
+        help="Slow attack time in ms",
     )
     p.add_argument(
-        "--release-time-ms", type=float, default=100.0, help="Release time in ms"
+        "--release-time-fast-ms",
+        type=float,
+        default=91e3 * 0.47e-6 * 1000,
+        help="Fast release time in ms",
+    )
+    p.add_argument(
+        "--release-time-slow-ms",
+        type=float,
+        default=750e3 * 6.8e-6 * 1000,
+        help="Slow release time in ms",
     )
     p.add_argument(
         "--k",
@@ -284,9 +236,9 @@ if __name__ == "__main__":
         test_file_path=args.test_file_path,
         comp_thresh=args.comp_thresh,
         comp_ratio=args.comp_ratio,
-        exp_thresh=args.exp_thresh,
-        exp_ratio=args.exp_ratio,
-        attack_time_ms=args.attack_time_ms,
-        release_time_ms=args.release_time_ms,
+        attack_time_fast_ms=args.attack_time_fast_ms,
+        attack_time_slow_ms=args.attack_time_slow_ms,
+        release_time_fast_ms=args.release_time_fast_ms,
+        release_time_slow_ms=args.release_time_slow_ms,
         k=args.k,
     )

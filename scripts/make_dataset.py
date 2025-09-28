@@ -43,6 +43,9 @@ from differential_dynamics.benchmarks.signals import (
     burst,
     ramp,
     composite_program,
+    am_tone,
+    beating_tones,
+    am_noise,
 )
 from third_party.torchcomp_core.torchcomp import ms2coef
 
@@ -81,27 +84,33 @@ def resample_if_needed(waveform: torch.Tensor, sr: int, target_sr: int) -> torch
     return tfm(waveform)
 
 
-def sample_theta(rng: random.Random) -> Theta:
+def sample_theta(
+    rng: random.Random,
+    at_min_ms: float,
+    at_max_ms: float,
+    rt_min_ms: float,
+    rt_max_ms: float,
+) -> Theta:
     """Sample a single teacher parameter set θ.
 
     The sampled θ is intended to be applied to ALL clips within a permutation,
     so call this exactly once per perm (not per-clip) to avoid leakage of
     content dependence into θ.
 
-    Ranges (reasonable studio-like defaults):
+    Default ranges (reasonable studio-like defaults) can be narrowed via args:
       - comp_thresh_db CT: uniform in [-36, -18] dB
       - comp_ratio    CR: choice from {2, 4, 8}
-      - attack_ms   τ_a: log-uniform in [2, 50] ms
-      - release_ms  τ_r: log-uniform in [20, 400] ms
+      - attack_ms   τ_a: log-uniform in [at_min_ms, at_max_ms] ms
+      - release_ms  τ_r: log-uniform in [rt_min_ms, rt_max_ms] ms
     """
     # Threshold in [-36, -18] dB
     ct = rng.uniform(-36.0, -18.0)
     # Ratio from {2, 4, 8}
     cr = rng.choice([2.0, 4.0, 8.0])
-    # Attack ms log-uniform [2, 50]
-    at = math.exp(rng.uniform(math.log(2.0), math.log(50.0)))
-    # Release ms log-uniform [20, 400]
-    rt = math.exp(rng.uniform(math.log(20.0), math.log(400.0)))
+    # Attack ms log-uniform within bounds
+    at = math.exp(rng.uniform(math.log(at_min_ms), math.log(at_max_ms)))
+    # Release ms log-uniform within bounds
+    rt = math.exp(rng.uniform(math.log(rt_min_ms), math.log(rt_max_ms)))
     return Theta(ct, cr, at, rt)
 
 
@@ -128,7 +137,9 @@ def process_example(
     fs: int,
     theta: Theta,
     detector_ms: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    normalize: str = "none",  # "none" | "peak"
+    target_peak: float = 0.95,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """Compute x_rms, teacher gain (hard A/R), and the compressed target.
 
     Args:
@@ -146,6 +157,57 @@ def process_example(
     x = x.to(torch.float32)
     if x.dim() == 1:
         x = x.unsqueeze(0)
+
+    # Optional per-clip normalization (apply before computing envelopes/teacher)
+    norm_info: dict = {"method": normalize}
+    with torch.no_grad():
+        if normalize == "peak":
+            peak_before = float(torch.max(torch.abs(x)).item())
+            if peak_before > 1e-9 and math.isfinite(peak_before):
+                scale = float(target_peak / peak_before)
+            else:
+                scale = 1.0
+            x = x * scale
+            norm_info.update(
+                {
+                    "target_peak": float(target_peak),
+                    "peak_before": float(peak_before),
+                    "scale": float(scale),
+                    "peak_after": float(torch.max(torch.abs(x)).item()),
+                }
+            )
+        elif normalize == "align_to_ct":
+            # Align median detector level to CT in dB for maximum near-threshold occupancy
+            alpha_det_probe = ms2coef(
+                torch.tensor(detector_ms, dtype=torch.float32), fs
+            )
+            x_rms0 = ema_1pole_lfilter(x.abs(), alpha_det_probe).clamp_min(1e-7)
+            L_med = float(torch.median(20.0 * torch.log10(x_rms0)).item())
+            CT = float(theta.comp_thresh_db)
+            delta_db = CT - L_med
+            scale = float(10 ** (delta_db / 20.0)) if math.isfinite(delta_db) else 1.0
+            x = x * scale
+            # Recompute probe after scaling for audit
+            x_rms1 = ema_1pole_lfilter(x.abs(), alpha_det_probe).clamp_min(1e-7)
+            L_med_after = float(torch.median(20.0 * torch.log10(x_rms1)).item())
+            norm_info.update(
+                {
+                    "ct_db": CT,
+                    "L_med_before_db": L_med,
+                    "scale": scale,
+                    "L_med_after_db": L_med_after,
+                }
+            )
+        else:
+            norm_info.update(
+                {
+                    "target_peak": None,
+                    "peak_before": None,
+                    "scale": 1.0,
+                    "peak_after": None,
+                }
+            )
+
     # Detector envelope (RMS-like EMA of |x|)
     alpha_det = ms2coef(torch.tensor(detector_ms, dtype=torch.float32), fs)
     x_rms = ema_1pole_lfilter(x.abs(), alpha_det).clamp_min(1e-7)
@@ -163,7 +225,7 @@ def process_example(
     )
     g_ref = comp.classical_compexp_gain(x_rms)
     y_ref = g_ref * x
-    return x, x_rms, g_ref, y_ref
+    return x, x_rms, g_ref, y_ref, norm_info
 
 
 def save_example(
@@ -179,6 +241,7 @@ def save_example(
     detector_ms: float,
     seed: int,
     processing_version: str = "v0",
+    norm_info: dict | None = None,
 ) -> None:
     """Persist artifacts for a single example under clip_XXXX/.
 
@@ -206,6 +269,8 @@ def save_example(
         "processing_version": processing_version,
         "num_samples": int(x.shape[-1]),
     }
+    if norm_info is not None:
+        meta["normalization"] = norm_info
     with open(ex_dir / "meta.yaml", "w") as f:
         yaml.safe_dump(meta, f, sort_keys=True)
 
@@ -305,6 +370,21 @@ def main():
         "--clip-dur-s", type=float, default=2, help="Clip duration in seconds"
     )
 
+    # Optional per-clip normalization
+    p.add_argument(
+        "--normalize",
+        type=str,
+        default="align_to_ct",
+        choices=["none", "peak", "align_to_ct"],
+        help="Per-clip normalization to apply before computing envelopes/teacher (align_to_ct uses detector median to match CT)",
+    )
+    p.add_argument(
+        "--target-peak",
+        type=float,
+        default=0.9,
+        help="Target absolute peak amplitude when --normalize=peak",
+    )
+
     # Seeds: separate θ from content to avoid leakage while keeping θ fixed per perm across splits
     p.add_argument(
         "--theta-seed",
@@ -351,12 +431,52 @@ def main():
         help="Fraction of clips per split to source from music (rest from synthetic)",
     )
 
+    # Time-constant sampling controls
+    p.add_argument(
+        "--fast-times",
+        action="store_true",
+        help="Use fast A/R ranges (AT: 2-15 ms, RT: 30-120 ms)",
+    )
+    p.add_argument(
+        "--at-min-ms",
+        type=float,
+        default=None,
+        help="Min attack time (ms) for sampling (overrides fast-times)",
+    )
+    p.add_argument(
+        "--at-max-ms",
+        type=float,
+        default=None,
+        help="Max attack time (ms) for sampling (overrides fast-times)",
+    )
+    p.add_argument(
+        "--rt-min-ms",
+        type=float,
+        default=None,
+        help="Min release time (ms) for sampling (overrides fast-times)",
+    )
+    p.add_argument(
+        "--rt-max-ms",
+        type=float,
+        default=None,
+        help="Max release time (ms) for sampling (overrides fast-times)",
+    )
+
     # Totals and split percentages
     p.add_argument(
         "--num-total",
         type=int,
         default=120,
         help="Total clips per split (train/val/test)",
+    )
+
+    # Synthetic mode
+    p.add_argument(
+        "--synthetic-mode",
+        type=str,
+        default="composite",
+        choices=["composite", "hard_cases"],
+        help="Synthetic generator: composite (diverse) or hard_cases (AM/beating/noise-AM)",
     )
     p.add_argument(
         "--split-pcts",
@@ -424,11 +544,35 @@ def main():
         if len(items) < n_music:
             deficit = n_music - len(items)
             n_synth += deficit
-        # Synthetic via composite programs
+        # Synthetic via selected mode
         T = int(round(args.clip_dur_s * args.fs))
         for _ in range(n_synth):
-            x = composite_program(fs=args.fs, T=T, B=1, rng=rng)
-            items.append((x, args.fs, "synth:composite"))
+            if args.synthetic_mode == "hard_cases":
+                # Choose a hard case generator
+                kind = rng.choice(["am_tone", "beating", "am_noise"])  # bias to AM around CT
+                if kind == "am_tone":
+                    carrier = rng.uniform(200.0, 2000.0)
+                    rate = rng.uniform(1.0, 6.0)
+                    depth = rng.uniform(0.3, 0.8)
+                    ampv = rng.uniform(0.2, 0.8)
+                    x = am_tone(fs=args.fs, T=T, B=1, carrier_hz=carrier, am_hz=rate, depth=depth, amp=ampv)
+                    src = f"synth:am_tone({carrier:.1f},{rate:.2f},{depth:.2f})"
+                elif kind == "beating":
+                    base = rng.uniform(150.0, 1500.0)
+                    beat = rng.uniform(1.0, 6.0)
+                    ampv = rng.uniform(0.2, 0.8)
+                    x = beating_tones(fs=args.fs, T=T, B=1, base_hz=base, beat_hz=beat, amp=ampv)
+                    src = f"synth:beating({base:.1f},{beat:.2f})"
+                else:  # am_noise
+                    rate = rng.uniform(1.0, 6.0)
+                    depth = rng.uniform(0.3, 0.8)
+                    ampv = rng.uniform(0.1, 0.4)
+                    x = am_noise(fs=args.fs, T=T, B=1, am_hz=rate, depth=depth, amp=ampv)
+                    src = f"synth:am_noise({rate:.2f},{depth:.2f})"
+                items.append((x, args.fs, src))
+            else:
+                x = composite_program(fs=args.fs, T=T, B=1, rng=rng)
+                items.append((x, args.fs, "synth:composite"))
         if len(items) != n_total:
             # Adjust by trimming or padding synthetics
             if len(items) > n_total:
@@ -446,17 +590,44 @@ def main():
         "test": build_split_items("test", args.seed_test),
     }
 
+    # Resolve time ranges
+    if (
+        args.at_min_ms is not None
+        and args.at_max_ms is not None
+        and args.at_min_ms < args.at_max_ms
+    ):
+        at_min, at_max = args.at_min_ms, args.at_max_ms
+    elif args.fast_times:
+        at_min, at_max = 0.1, 1.0
+    else:
+        at_min, at_max = 2.0, 50.0
+    if (
+        args.rt_min_ms is not None
+        and args.rt_max_ms is not None
+        and args.rt_min_ms < args.rt_max_ms
+    ):
+        rt_min, rt_max = args.rt_min_ms, args.rt_max_ms
+    elif args.fast_times:
+        rt_min, rt_max = 30.0, 60.0
+    else:
+        rt_min, rt_max = 20.0, 400.0
+
     # Generate permutations with fixed theta per permutation across splits
     for perm_idx in range(1, args.num_perms + 1):
         # θ is sampled ONCE per permutation and reused across all splits
         theta_rng = random.Random(args.theta_seed + perm_idx)
-        theta = sample_theta(theta_rng)
+        theta = sample_theta(theta_rng, at_min, at_max, rt_min, rt_max)
         for split_name, items in items_by_split.items():
             split_sub = f"{split_name}/perm_{perm_idx:03d}"
             for idx, (x, fs, src) in enumerate(items, start=1):
                 # Teacher = hard A/R classical baseline; detector_ms fixed
-                x, x_rms, g_ref, y_ref = process_example(
-                    x, fs, theta, detector_ms=args.detector_ms
+                x, x_rms, g_ref, y_ref, norm_info = process_example(
+                    x,
+                    fs,
+                    theta,
+                    detector_ms=args.detector_ms,
+                    normalize=args.normalize,
+                    target_peak=args.target_peak,
                 )
                 # Persist artifacts; keep the split-specific seed in metadata for provenance
                 save_example(
@@ -475,6 +646,7 @@ def main():
                         "val": args.seed_val,
                         "test": args.seed_test,
                     }[split_name],
+                    norm_info=norm_info,
                 )
             print(
                 f"Wrote {split_sub} with CT={theta.comp_thresh_db:.1f}dB CR={theta.comp_ratio:.1f} AT={theta.attack_ms:.1f}ms RT={theta.release_ms:.1f}ms (clips: {len(items)})"

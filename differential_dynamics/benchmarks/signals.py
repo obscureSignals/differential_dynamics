@@ -98,6 +98,45 @@ def white_noise(fs: int, T: int, B: int = 1, amp: float = 0.1) -> torch.Tensor:
     return amp * torch.randn(B, T)
 
 
+def beating_tones(
+    fs: int,
+    T: int,
+    B: int = 1,
+    base_hz: float = 440.0,
+    beat_hz: float = 3.0,
+    amp: float = 0.5,
+) -> torch.Tensor:
+    """Two sine tones with small frequency separation to produce beating in the envelope.
+    Returns (B, T)
+    """
+    t = torch.arange(T).float() / fs
+    x = 0.5 * (
+        torch.sin(2 * math.pi * base_hz * t) + torch.sin(2 * math.pi * (base_hz + beat_hz) * t)
+    )
+    return amp * x[None, :].repeat(B, 1)
+
+
+essentially_zero = 1e-12
+
+
+def am_noise(
+    fs: int,
+    T: int,
+    B: int = 1,
+    am_hz: float = 3.0,
+    depth: float = 0.5,
+    amp: float = 0.2,
+) -> torch.Tensor:
+    """Amplitude-modulated white noise (slow AM for near-CT fluctuation).
+    Returns (B, T)
+    """
+    t = torch.arange(T).float() / fs
+    mod = 1.0 + depth * torch.sin(2 * math.pi * am_hz * t)
+    mod = torch.clamp(mod, min=0.0)
+    n = torch.randn(B, T)
+    return amp * (n * mod[None, :])
+
+
 def composite_program(
     fs: int,
     T: int,
