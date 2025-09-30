@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <vector>
+#include <csignal>
 
 namespace {
 
@@ -84,45 +85,58 @@ inline bool solve2x2(float a11, float a12, float a21, float a22,
 //   k: gate sharpness (scalar)
 //   fs: sample rate (scalar Hz)
 // Output: y_db: (B, T) smoothed gain in dB
+
+
 torch::Tensor ssl_smoother_forward(
-    const torch::Tensor& g_raw_db_in,
+    const torch::Tensor& x_peak_dB_in,
     const torch::Tensor& T_af_in,
     const torch::Tensor& T_as_in,
     const torch::Tensor& T_sf_in,
     const torch::Tensor& T_ss_in,
-    double k,
+    const torch::Tensor& comp_slope_in,
+    const torch::Tensor& comp_thresh_in,
+    const torch::Tensor& feedback_coeff_in,
+    const torch::Tensor& k_in,
     double fs) {
-  TORCH_CHECK(g_raw_db_in.device().is_cpu(), "ssl_smoother_forward: CPU tensor expected for g_raw_db");
-  TORCH_CHECK(g_raw_db_in.dtype() == torch::kFloat, "ssl_smoother_forward: float32 expected for g_raw_db");
-  TORCH_CHECK(g_raw_db_in.dim() == 2, "g_raw_db must be (B,T)");
+  TORCH_CHECK(x_peak_dB_in.device().is_cpu(), "ssl_smoother_forward: CPU tensor expected for g_raw_db");
+  TORCH_CHECK(x_peak_dB_in.dtype() == torch::kFloat, "ssl_smoother_forward: float32 expected for g_raw_db");
+  TORCH_CHECK(x_peak_dB_in.dim() == 2, "g_raw_db must be (B,T)");
   TORCH_CHECK(T_af_in.device().is_cpu() && T_as_in.device().is_cpu() &&
-                  T_sf_in.device().is_cpu() && T_ss_in.device().is_cpu(),
+                  T_sf_in.device().is_cpu() && T_ss_in.device().is_cpu() && comp_slope_in.device().is_cpu() && comp_thresh_in.device().is_cpu() && feedback_coeff_in.device().is_cpu() && k_in.device().is_cpu(),
               "time constant tensors must be on CPU");
   TORCH_CHECK(T_af_in.dtype() == torch::kFloat && T_as_in.dtype() == torch::kFloat &&
-                  T_sf_in.dtype() == torch::kFloat && T_ss_in.dtype() == torch::kFloat,
+                  T_sf_in.dtype() == torch::kFloat && T_ss_in.dtype() == torch::kFloat && comp_slope_in.dtype() == torch::kFloat && comp_thresh_in.dtype() == torch::kFloat && feedback_coeff_in.dtype() == torch::kFloat && k_in.dtype() == torch::kFloat,
               "time constant tensors must be float32");
-  TORCH_CHECK(T_af_in.dim() == 1 && T_as_in.dim() == 1 && T_sf_in.dim() == 1 && T_ss_in.dim() == 1,
+  TORCH_CHECK(T_af_in.dim() == 1 && T_as_in.dim() == 1 && T_sf_in.dim() == 1 && T_ss_in.dim() == 1 && comp_slope_in.dim() == 1 && comp_thresh_in.dim() == 1 && feedback_coeff_in.dim() == 1 && k_in.dim() == 1,
               "time constant tensors must be (B,)");
 
-  const auto B = static_cast<int64_t>(g_raw_db_in.size(0));
-  const auto T = static_cast<int64_t>(g_raw_db_in.size(1));
-  TORCH_CHECK(T_af_in.size(0) == B && T_as_in.size(0) == B && T_sf_in.size(0) == B && T_ss_in.size(0) == B,
+  const auto B = static_cast<int64_t>(x_peak_dB_in.size(0));
+  const auto T = static_cast<int64_t>(x_peak_dB_in.size(1));
+  TORCH_CHECK(T_af_in.size(0) == B && T_as_in.size(0) == B && T_sf_in.size(0) == B && T_ss_in.size(0) == B && comp_slope_in.size(0) == B && comp_thresh_in.size(0) == B && feedback_coeff_in.size(0) == B && k_in.size(0) == B,
               "time constant batch sizes must match B");
 
-  auto g_raw_db = g_raw_db_in.contiguous();
+  auto x_peak_dB = x_peak_dB_in.contiguous();
   auto T_af = T_af_in.contiguous();
   auto T_as = T_as_in.contiguous();
   auto T_sf = T_sf_in.contiguous();
   auto T_ss = T_ss_in.contiguous();
-  auto y_db = torch::empty_like(g_raw_db);
+  auto comp_slope = comp_slope_in.contiguous();
+  auto comp_thresh = comp_thresh_in.contiguous();
+  auto feedback_coeff = feedback_coeff_in.contiguous();
+  auto k = k_in.contiguous();
+  auto y_db = torch::empty_like(x_peak_dB);
 
   const float Ts = 1.0f / static_cast<float>(fs);
-  const float kf = static_cast<float>(k);
 
   at::parallel_for(0, B, 1, [&](int64_t b_begin, int64_t b_end) {
     for (int64_t b = b_begin; b < b_end; ++b) {
-      const float* g_ptr = g_raw_db.data_ptr<float>() + b * T;
+      const float* x_ptr = x_peak_dB.data_ptr<float>() + b * T;
       float* y_ptr = y_db.data_ptr<float>() + b * T;
+
+      const float comp_slope_f = comp_slope.data_ptr<float>()[b];
+      const float comp_thresh_f = comp_thresh.data_ptr<float>()[b];
+      const float fb_f = feedback_coeff.data_ptr<float>()[b];
+      const float kf = k.data_ptr<float>()[b];
 
       // Convert time constants to rates (positive)
       const float Taf = std::max(T_af.data_ptr<float>()[b], 1e-12f);
@@ -140,9 +154,12 @@ torch::Tensor ssl_smoother_forward(
       float y_prev = 0.0f;  // 0 dB = unity
 
       for (int64_t t = 0; t < T; ++t) {
-        const float g_now = g_ptr[t];
-        const float s = stable_sigmoid(kf * (g_now - y_prev));
-
+        const float x_dB_now = x_ptr[t] + y_prev * fb_f; // apply feedback
+        float gain_raw_db = comp_slope_f * (comp_thresh_f - x_dB_now);
+        if (gain_raw_db > 0.0f) {
+            gain_raw_db = 0.0f;
+        }
+        const float s = stable_sigmoid(kf * (gain_raw_db - y_prev));
         const float series_f = (1.0f - s) * af_r;
         const float series_s = (1.0f - s) * as_r;
 
@@ -171,8 +188,8 @@ torch::Tensor ssl_smoother_forward(
         }
 
         // State update
-        const float nx1 = Ad11 * x1 + Ad12 * x2 + Bd1 * g_now;
-        const float nx2 = Ad21 * x1 + Ad22 * x2 + Bd2 * g_now;
+        const float nx1 = Ad11 * x1 + Ad12 * x2 + Bd1 * gain_raw_db;
+        const float nx2 = Ad21 * x1 + Ad22 * x2 + Bd2 * gain_raw_db;
         x1 = nx1;
         x2 = nx2;
         const float y_t = x1 + x2;  // [1 1] x

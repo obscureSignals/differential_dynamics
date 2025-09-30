@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CLionExternalBuildManager">
+    <target id="8227a8ef-187f-44d2-8535-5f3db1dbe0a9" name="diff_dynamics" defaultType="TOOL">
+      <configuration id="0befd4f9-29c6-4886-bc6f-9cb9f888123f" name="diff_dynamics">
+        <build type="TOOL">
+          <tool actionId="Tool_External Tools_diff_dynamics" />
+        </build>
+      </configuration>
+    </target>
+  </component>
+</project>

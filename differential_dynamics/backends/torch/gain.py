@@ -22,8 +22,8 @@ import numpy as np
 import torch
 from numba import njit, prange
 
-from differential_dynamics.benchmarks.bench_utilities import gain_db, np_gain_db_scalar
 from differential_dynamics.backends.torch.ssl_smoother_ext import ssl2_smoother
+from differential_dynamics.benchmarks.bench_utilities import gain_db, np_gain_db_scalar
 from third_party.torchcomp_core.torchcomp import amp2db, db2amp, compexp_gain
 
 # Prefer compiled C++ smoother for sigmoid gating; falls back to Python if build fails
@@ -324,9 +324,9 @@ def SSL_comp_gain(
     T_attack_slow: Union[torch.Tensor, float],
     T_shunt_fast: Union[torch.Tensor, float],
     T_shunt_slow: Union[torch.Tensor, float],
+    k: Union[torch.Tensor, float],
+    feedback_coeff: Union[torch.Tensor, float],
     fs: float,
-    k: float = 1.0,
-    smoother_backend: str = "torchscript",  # "torchscript" | "numba"
 ) -> torch.Tensor:
     """
     SSL-style compressor gain function
@@ -347,28 +347,27 @@ def SSL_comp_gain(
     B, T = x_peak_dB.shape
     dev, dt = x_peak_dB.device, x_peak_dB.dtype
 
-    # Compute static curve in dB with clamping (identical to torchcomp)
-    comp_thresh_t = torch.as_tensor(comp_thresh, device=dev, dtype=dt).expand(B)
-    comp_ratio_t = torch.as_tensor(comp_ratio, device=dev, dtype=dt).expand(B)
-
-    comp_slope = 1.0 - 1.0 / comp_ratio_t
-
-    gain_raw_dB = (
-        comp_slope[:, None] * (comp_thresh_t[:, None] - x_peak_dB).neg().relu().neg()
-    )
+    comp_slope = 1.0 - 1.0 / comp_ratio
 
     T_attack_fast_t = torch.as_tensor(T_attack_fast, device=dev, dtype=dt).expand(B)
     T_attack_slow_t = torch.as_tensor(T_attack_slow, device=dev, dtype=dt).expand(B)
     T_shunt_fast_t = torch.as_tensor(T_shunt_fast, device=dev, dtype=dt).expand(B)
     T_shunt_slow_t = torch.as_tensor(T_shunt_slow, device=dev, dtype=dt).expand(B)
+    comp_slope_t = torch.as_tensor(comp_slope, device=dev, dtype=dt).expand(B)
+    comp_thresh_t = torch.as_tensor(comp_thresh, device=dev, dtype=dt).expand(B)
+    feedback_coeff_t = torch.as_tensor(feedback_coeff, device=dev, dtype=dt).expand(B)
+    k_t = torch.as_tensor(k, device=dev, dtype=dt).expand(B)
 
     y_db = ssl2_smoother(
-        gain_raw_dB,
-        T_attack_fast_t,
-        T_attack_slow_t,
-        T_shunt_fast_t,
-        T_shunt_slow_t,
-        k=k,
+        x_peak_dB=x_peak_dB,
+        T_af=T_attack_fast_t,
+        T_as=T_attack_slow_t,
+        T_sf=T_shunt_fast_t,
+        T_ss=T_shunt_slow_t,
+        comp_slope=comp_slope_t,
+        comp_thresh=comp_thresh_t,
+        feedback_coeff=feedback_coeff_t,
+        k=k_t,
         fs=fs,
     )
     return y_db

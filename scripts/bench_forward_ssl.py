@@ -9,9 +9,7 @@ import torch
 import torchaudio
 
 from differential_dynamics.backends.torch.gain import SSL_comp_gain
-from differential_dynamics.benchmarks.bench_utilities import (
-    gain_db,
-)
+from differential_dynamics.benchmarks.bench_utilities import gain_db
 from differential_dynamics.benchmarks.signals import step, tone, burst, ramp
 
 # Configure logging
@@ -26,14 +24,15 @@ with torch.no_grad():
 
     def run_bench(
         test_signal_type: str,
+        comp_thresh: Union[float, str],
+        comp_ratio: float,
+        attack_time_fast_ms: float,
+        attack_time_slow_ms: float,
+        release_time_fast_ms: float,
+        release_time_slow_ms: float,
+        feedback_coeff: float,
+        k: float,
         test_file_path: str = None,
-        comp_thresh: Union[float, str] = -24.0,
-        comp_ratio: float = 4.0,
-        attack_time_fast_ms: float = 10.0,
-        attack_time_slow_ms: float = 10.0,
-        release_time_fast_ms: float = 100.0,
-        release_time_slow_ms: float = 100.0,
-        k: float = 1.0,
     ):
 
         if test_signal_type == "file":
@@ -59,7 +58,7 @@ with torch.no_grad():
                 )
             elif test_signal_type == "burst":
                 test_signal = burst(
-                    fs=fs, T=T, B=B, start=0.2, dur=0.1, amp=0.8, freq=freq
+                    fs=fs, T=T, B=B, start=0.2, dur=0.2, amp=0.9, freq=freq
                 )
             elif test_signal_type == "ramp":
                 test_signal = ramp(fs=fs, T=T, B=B, start=0.2, dur=0.4, a0=0.1, a1=0.8)
@@ -94,8 +93,9 @@ with torch.no_grad():
             T_attack_slow=attack_time_slow_ms / 1000,
             T_shunt_fast=release_time_fast_ms / 1000,
             T_shunt_slow=release_time_slow_ms / 1000,
-            fs=fs,
+            feedback_coeff=feedback_coeff,
             k=k,
+            fs=fs,
         )
 
         # Plot gain traces
@@ -220,6 +220,12 @@ if __name__ == "__main__":
         default=1.0,
         help="Multiplier for diff in sigmoid gating (higher = harder)",
     )
+    p.add_argument(
+        "--feedback-coeff",
+        type=float,
+        default=0.5,
+        help="Feedback coefficient, 0 to 1",
+    )
 
     args = p.parse_args()
 
@@ -233,12 +239,13 @@ if __name__ == "__main__":
 
     run_bench(
         test_signal_type=args.test_signal_type,
-        test_file_path=args.test_file_path,
         comp_thresh=args.comp_thresh,
         comp_ratio=args.comp_ratio,
         attack_time_fast_ms=args.attack_time_fast_ms,
         attack_time_slow_ms=args.attack_time_slow_ms,
         release_time_fast_ms=args.release_time_fast_ms,
         release_time_slow_ms=args.release_time_slow_ms,
+        feedback_coeff=args.feedback_coeff,
         k=args.k,
+        test_file_path=args.test_file_path,
     )
