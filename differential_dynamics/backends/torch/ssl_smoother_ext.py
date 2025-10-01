@@ -2,10 +2,11 @@
 #
 # Exposes a PyTorch autograd.Function with:
 # - forward: calls into the C++ CPU kernel (y_db in dB)
-# - backward: fails loudly for now (to be implemented next)
+# - backward: implemented on CPU for hard gate (soft_gate=False). Soft gate will raise.
 #
 # Build modes (controlled by env):
 # - SSL_SMOOTHER_DEBUG=1 -> build with -g -O0 -fno-omit-frame-pointer, verbose=True, separate cache dir
+# - SSL_SMOOTHER_FORCE_REBUILD=1 -> remove cached build and force a full rebuild
 # - default (unset)      -> build with -O3 and native arch on macOS
 #
 # The C++ extension is built lazily via torch.utils.cpp_extension.load from
@@ -139,7 +140,6 @@ class SSL2StateSmootherFunction(Function):
         # Save tensors for backward implementation later
         ctx.save_for_backward(
             x_peak_dB,
-            y_db,
             T_af,
             T_as,
             T_sf,
@@ -150,12 +150,47 @@ class SSL2StateSmootherFunction(Function):
             k,
         )
         ctx.fs = float(fs)
+        ctx.soft_gate = bool(soft_gate)
         return y_db
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        # Explicitly fail loudly to match project policy.
-        raise RuntimeError("SSL2StateSmootherFunction.backward not implemented yet")
+        x_peak_dB, T_af, T_as, T_sf, T_ss, comp_slope, comp_thresh, feedback_coeff, k = ctx.saved_tensors
+        fs = ctx.fs
+        soft_gate = ctx.soft_gate
+        if grad_out.device.type != "cpu":
+            grad_out = grad_out.cpu()
+        ext = _get_ext()
+        grads = ext.backward(
+            grad_out.contiguous().float(),
+            x_peak_dB.contiguous().float(),
+            T_af.contiguous().float(),
+            T_as.contiguous().float(),
+            T_sf.contiguous().float(),
+            T_ss.contiguous().float(),
+            comp_slope.contiguous().float(),
+            comp_thresh.contiguous().float(),
+            feedback_coeff.contiguous().float(),
+            k.contiguous().float(),
+            float(fs),
+            bool(soft_gate),
+        )
+        # grads order: gx, gT_af, gT_as, gT_sf, gT_ss, g_slope, g_thresh, g_fb, g_k
+        gx, gT_af, gT_as, gT_sf, gT_ss, g_slope, g_thresh, g_fb, g_k = grads
+        # Return grads for each tensor input in forward, and None for fs, soft_gate
+        return (
+            gx,      # x_peak_dB
+            gT_af,   # T_af
+            gT_as,   # T_as
+            gT_sf,   # T_sf
+            gT_ss,   # T_ss
+            g_slope, # comp_slope
+            g_thresh,# comp_thresh
+            g_fb,    # feedback_coeff
+            g_k,     # k
+            None,    # fs (float)
+            None,    # soft_gate (bool)
+        )
 
 
 def ssl2_smoother(
@@ -171,9 +206,10 @@ def ssl2_smoother(
     fs: float,
     soft_gate: bool,
 ) -> torch.Tensor:
-    """Convenience wrapper: forward-only SSL 2-state smoother on CPU.
+    """Convenience wrapper for SSL 2-state smoother on CPU.
 
-    Returns y_db (in dB). Gradients will error until backward is implemented.
+    Returns y_db (in dB). Backward/gradients are implemented for hard gate
+    (soft_gate=False). Passing soft_gate=True will raise at backward.
     """
     return SSL2StateSmootherFunction.apply(
         x_peak_dB,

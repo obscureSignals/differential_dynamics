@@ -249,21 +249,251 @@ torch::Tensor ssl_smoother_forward(
   return y_db;
 }
 
-// Backward API (stub that fails loudly)
+// Numeric sensitivity of DiscreteAB wrt a single rate parameter q using central differences
+inline DiscreteAB zoh_disc_rates_eps(float series_fast, float series_slow, float shunt_fast, float shunt_slow, float Ts, int which, float eps) {
+  float sf = series_fast, ss = series_slow, hf = shunt_fast, hs = shunt_slow;
+  // Apply +eps to the selected parameter
+  switch (which) {
+    case 0: sf += eps; break; // R_attack_fast
+    case 1: ss += eps; break; // R_attack_slow
+    case 2: hf += eps; break; // R_shunt_fast
+    case 3: hs += eps; break; // R_shunt_slow
+    default: break;
+  }
+  return zoh_discretize_from_rates(sf, ss, hf, hs, Ts);
+}
+
+inline void numeric_dAB_drates(
+  float series_fast, float series_slow, float shunt_fast, float shunt_slow,
+  float Ts,
+  // outputs: d(Ad,Bd)/dq for q in {R_af,R_as,R_sf,R_ss}
+  DiscreteAB& d_q0, DiscreteAB& d_q1, DiscreteAB& d_q2, DiscreteAB& d_q3) {
+
+  const float eps_base = 1e-6f;
+  // Use relative epsilon based on magnitude
+  float q[4] = {series_fast, series_slow, shunt_fast, shunt_slow};
+  for (int i = 0; i < 4; ++i) {
+    float eps = eps_base * std::max(std::fabs(q[i]), 1.0f);
+    if (eps == 0.0f) eps = eps_base;
+    DiscreteAB plus = zoh_disc_rates_eps(series_fast, series_slow, shunt_fast, shunt_slow, Ts, i, +eps);
+    DiscreteAB minus = zoh_disc_rates_eps(series_fast, series_slow, shunt_fast, shunt_slow, Ts, i, -eps);
+    DiscreteAB d{};
+    d.Ad11 = (plus.Ad11 - minus.Ad11) / (2.0f * eps);
+    d.Ad12 = (plus.Ad12 - minus.Ad12) / (2.0f * eps);
+    d.Ad21 = (plus.Ad21 - minus.Ad21) / (2.0f * eps);
+    d.Ad22 = (plus.Ad22 - minus.Ad22) / (2.0f * eps);
+    d.Bd1  = (plus.Bd1  - minus.Bd1 ) / (2.0f * eps);
+    d.Bd2  = (plus.Bd2  - minus.Bd2 ) / (2.0f * eps);
+    if (i == 0) d_q0 = d;
+    else if (i == 1) d_q1 = d;
+    else if (i == 2) d_q2 = d;
+    else d_q3 = d;
+  }
+}
+
+// Backward API (hard gate). Computes grads w.r.t x_peak_dB, T_* (via rates), comp_slope, comp_thresh, feedback.
 std::vector<torch::Tensor> ssl_smoother_backward(
-    const torch::Tensor& /*grad_out_in*/,
-    const torch::Tensor& /*g_raw_db_in*/,
-    const torch::Tensor& /*y_db_in*/,
-    const torch::Tensor& /*T_af_in*/,
-    const torch::Tensor& /*T_as_in*/,
-    const torch::Tensor& /*T_sf_in*/,
-    const torch::Tensor& /*T_ss_in*/,
-    double /*k*/, double /*fs*/) {
-  TORCH_CHECK(false, "ssl_smoother_backward not implemented yet");
+    const torch::Tensor& grad_y_in,           // (B,T)
+    const torch::Tensor& x_peak_dB_in,        // (B,T)
+    const torch::Tensor& T_attack_fast_in,    // (B,)
+    const torch::Tensor& T_attack_slow_in,    // (B,)
+    const torch::Tensor& T_shunt_fast_in,     // (B,)
+    const torch::Tensor& T_shunt_slow_in,     // (B,)
+    const torch::Tensor& comp_slope_in,       // (B,)
+    const torch::Tensor& comp_thresh_in,      // (B,)
+    const torch::Tensor& feedback_coeff_in,   // (B,)
+    const torch::Tensor& k_in,                // (B,) (ignored in hard)
+    double fs,
+    bool soft_gate) {
+  TORCH_CHECK(grad_y_in.device().is_cpu() && x_peak_dB_in.device().is_cpu(), "backward: CPU tensors expected");
+  TORCH_CHECK(!soft_gate, "ssl_smoother_backward: soft gate not supported yet in backward (hard-only)");
+  TORCH_CHECK(grad_y_in.dtype() == torch::kFloat && x_peak_dB_in.dtype() == torch::kFloat, "float32 expected");
+  const auto B = static_cast<int64_t>(x_peak_dB_in.size(0));
+  const auto T = static_cast<int64_t>(x_peak_dB_in.size(1));
+  TORCH_CHECK(grad_y_in.sizes() == x_peak_dB_in.sizes(), "grad_y and x_peak_dB must have same shape");
+
+  auto grad_y = grad_y_in.contiguous();
+  auto x_peak_dB = x_peak_dB_in.contiguous();
+  auto T_af = T_attack_fast_in.contiguous();
+  auto T_as = T_attack_slow_in.contiguous();
+  auto T_sf = T_shunt_fast_in.contiguous();
+  auto T_ss = T_shunt_slow_in.contiguous();
+  auto comp_slope = comp_slope_in.contiguous();
+  auto comp_thresh = comp_thresh_in.contiguous();
+  auto feedback = feedback_coeff_in.contiguous();
+
+  // Outputs
+  auto gx = torch::zeros_like(x_peak_dB);
+  auto gT_af = torch::zeros_like(T_af);
+  auto gT_as = torch::zeros_like(T_as);
+  auto gT_sf = torch::zeros_like(T_sf);
+  auto gT_ss = torch::zeros_like(T_ss);
+  auto g_slope = torch::zeros_like(comp_slope);
+  auto g_thresh = torch::zeros_like(comp_thresh);
+  auto g_fb = torch::zeros_like(feedback);
+  auto g_k = torch::zeros_like(k_in); // zeros (hard)
+
+  const float Ts = 1.0f / static_cast<float>(fs);
+
+  // Per-batch processing
+  for (int64_t b = 0; b < B; ++b) {
+    const float* x_ptr = x_peak_dB.data_ptr<float>() + b * T;
+    const float* gy_ptr = grad_y.data_ptr<float>() + b * T;
+    float* gx_ptr = gx.data_ptr<float>() + b * T;
+
+    const float slope = comp_slope.data_ptr<float>()[b];
+    const float thresh = comp_thresh.data_ptr<float>()[b];
+    const float fb = feedback.data_ptr<float>()[b];
+
+    const float Taf = std::max(T_af.data_ptr<float>()[b], 1e-12f);
+    const float Tas = std::max(T_as.data_ptr<float>()[b], 1e-12f);
+    const float Tsf = std::max(T_sf.data_ptr<float>()[b], 1e-12f);
+    const float Tss = std::max(T_ss.data_ptr<float>()[b], 1e-12f);
+
+    const float Raf = 1.0f / Taf;
+    const float Ras = 1.0f / Tas;
+    const float Rsf = 1.0f / Tsf;
+    const float Rss = 1.0f / Tss;
+
+    // Precompute hard-gate discrete systems
+    DiscreteAB AB_attack = zoh_discretize_from_rates(Raf, Ras, Rsf, Rss, Ts);
+    DiscreteAB AB_release = zoh_discretize_from_rates(0.f, 0.f, Rsf, Rss, Ts);
+
+    // We intentionally skip per-step numeric sensitivities for time constants here.
+    // Time-constant gradients will be computed via finite differences on the
+    // scalar loss defined by grad_y later in this function.
+
+    // Forward recompute to capture states and branch mask
+    std::vector<float> x1_prev(T), x2_prev(T), y_prev_arr(T), g_arr(T);
+    std::vector<uint8_t> at_mask(T);
+    float x1 = 0.f, x2 = 0.f, y_prev = 0.f;
+
+    for (int64_t t = 0; t < T; ++t) {
+      x1_prev[t] = x1; x2_prev[t] = x2; y_prev_arr[t] = y_prev;
+      const float xdb = x_ptr[t] + fb * y_prev;
+      float a = slope * (thresh - xdb);
+      if (a > 0.f) a = 0.f;
+      g_arr[t] = a;
+      const float delta = a - y_prev;
+      const bool is_attack = (delta < 0.f);
+      at_mask[t] = static_cast<uint8_t>(is_attack);
+      const DiscreteAB& AB = is_attack ? AB_attack : AB_release;
+      const float nx1 = AB.Ad11 * x1 + AB.Ad12 * x2 + AB.Bd1 * a;
+      const float nx2 = AB.Ad21 * x1 + AB.Ad22 * x2 + AB.Bd2 * a;
+      x1 = nx1; x2 = nx2;
+      y_prev = x1 + x2;
+    }
+
+    // Reverse scan
+    float l1 = 0.f, l2 = 0.f; // adjoint for x (2-vector)
+
+    for (int64_t t = T - 1; t >= 0; --t) {
+      // Seed from y_t
+      l1 += gy_ptr[t];
+      l2 += gy_ptr[t];
+
+      const bool is_attack = (at_mask[t] != 0);
+      const DiscreteAB& AB = is_attack ? AB_attack : AB_release;
+
+      const float a = g_arr[t];
+      const float x1_t = x1_prev[t];
+      const float x2_t = x2_prev[t];
+      const float y_prev_t = y_prev_arr[t];
+
+      // dL/dg = (Bd^T) * lambda
+      const float dL_dg = AB.Bd1 * l1 + AB.Bd2 * l2;
+
+      // Static curve chain (hard clamp mask m = [a < 0])
+      const float m = (a < 0.f) ? 1.f : 0.f;
+      const float gamma = dL_dg * m;
+
+      // Grads for slope, thresh, x_peak_dB, fb and feedback into y_{t-1}
+      // a = slope * (thresh - (x_peak_dB + fb * y_{t-1}))
+      g_slope.data_ptr<float>()[b] += gamma * (thresh - (x_peak_dB.data_ptr<float>()[b*T + t] + fb * y_prev_t));
+      g_thresh.data_ptr<float>()[b] += gamma * slope;
+      gx_ptr[t] += gamma * (-slope);
+      g_fb.data_ptr<float>()[b] += gamma * (-slope) * y_prev_t;
+      const float add_y_prev_scalar = gamma * (-slope) * fb; // to y_{t-1}
+
+      // Propagate adjoint to previous state: lambda_t = Ad^T * lambda_{t+1} + [1,1]*add_y_prev_scalar
+      const float nl1 = AB.Ad11 * l1 + AB.Ad21 * l2 + add_y_prev_scalar;
+      const float nl2 = AB.Ad12 * l1 + AB.Ad22 * l2 + add_y_prev_scalar;
+      l1 = nl1; l2 = nl2;
+    }
+
+    // Finite-difference gradients for time constants using scalar loss L = sum_t grad_y[t] * y[t]
+    auto scalar_loss_for_Ts = [&](float Taf_v, float Tas_v, float Tsf_v, float Tss_v) -> float {
+      Taf_v = std::max(Taf_v, 1e-12f);
+      Tas_v = std::max(Tas_v, 1e-12f);
+      Tsf_v = std::max(Tsf_v, 1e-12f);
+      Tss_v = std::max(Tss_v, 1e-12f);
+      const float Raf_v = 1.0f / Taf_v;
+      const float Ras_v = 1.0f / Tas_v;
+      const float Rsf_v = 1.0f / Tsf_v;
+      const float Rss_v = 1.0f / Tss_v;
+      DiscreteAB ABa = zoh_discretize_from_rates(Raf_v, Ras_v, Rsf_v, Rss_v, Ts);
+      DiscreteAB ABr = zoh_discretize_from_rates(0.f, 0.f, Rsf_v, Rss_v, Ts);
+      float x1l = 0.f, x2l = 0.f, yprevl = 0.f;
+      float L = 0.f;
+      for (int64_t t = 0; t < T; ++t) {
+        const float xdb = x_ptr[t] + fb * yprevl;
+        float a = slope * (thresh - xdb);
+        if (a > 0.f) a = 0.f;
+        const float delta = a - yprevl;
+        const bool is_attack = (delta < 0.f);
+        const DiscreteAB& AB = is_attack ? ABa : ABr;
+        const float nx1 = AB.Ad11 * x1l + AB.Ad12 * x2l + AB.Bd1 * a;
+        const float nx2 = AB.Ad21 * x1l + AB.Ad22 * x2l + AB.Bd2 * a;
+        x1l = nx1; x2l = nx2;
+        const float y_t = x1l + x2l;
+        L += gy_ptr[t] * y_t;
+        yprevl = y_t;
+      }
+      return L;
+    };
+    const float eps = 1e-3f;
+    // T_attack_fast
+    {
+      const float Lp = scalar_loss_for_Ts(Taf + eps, Tas, Tsf, Tss);
+      const float Lm = scalar_loss_for_Ts(Taf - eps, Tas, Tsf, Tss);
+      gT_af.data_ptr<float>()[b] = (Lp - Lm) / (2.0f * eps);
+    }
+    // T_attack_slow
+    {
+      const float Lp = scalar_loss_for_Ts(Taf, Tas + eps, Tsf, Tss);
+      const float Lm = scalar_loss_for_Ts(Taf, Tas - eps, Tsf, Tss);
+      gT_as.data_ptr<float>()[b] = (Lp - Lm) / (2.0f * eps);
+    }
+    // T_shunt_fast
+    {
+      const float Lp = scalar_loss_for_Ts(Taf, Tas, Tsf + eps, Tss);
+      const float Lm = scalar_loss_for_Ts(Taf, Tas, Tsf - eps, Tss);
+      gT_sf.data_ptr<float>()[b] = (Lp - Lm) / (2.0f * eps);
+    }
+    // T_shunt_slow
+    {
+      const float Lp = scalar_loss_for_Ts(Taf, Tas, Tsf, Tss + eps);
+      const float Lm = scalar_loss_for_Ts(Taf, Tas, Tsf, Tss - eps);
+      gT_ss.data_ptr<float>()[b] = (Lp - Lm) / (2.0f * eps);
+    }
+  }
+
+  // Return grads in the order of inputs to forward wrapper
+  return {
+    gx,        // grad x_peak_dB
+    gT_af,     // grad T_attack_fast
+    gT_as,     // grad T_attack_slow
+    gT_sf,     // grad T_shunt_fast
+    gT_ss,     // grad T_shunt_slow
+    g_slope,   // grad comp_slope
+    g_thresh,  // grad comp_thresh
+    g_fb,      // grad feedback_coeff
+    g_k        // grad k (zeros in hard)
+  };
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &ssl_smoother_forward, "SSL 2-state smoother forward (CPU)");
-  m.def("backward", &ssl_smoother_backward, "SSL 2-state smoother backward (CPU, stub)");
+  m.def("backward", &ssl_smoother_backward, "SSL 2-state smoother backward (CPU, hard gate)");
 }
 
