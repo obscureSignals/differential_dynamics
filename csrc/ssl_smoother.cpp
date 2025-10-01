@@ -18,6 +18,12 @@
 
 namespace {
 
+  // 2x2 Ad and 2x1 Bd, all scalars; trivially inlinable/pass-by-value
+struct DiscreteAB {
+  float Ad11, Ad12, Ad21, Ad22;
+  float Bd1, Bd2;
+};
+
 inline float stable_sigmoid(float x) {
   // Clamp to avoid exp overflow; ~1e-26 tails in float32
   if (x < -60.0f) x = -60.0f;
@@ -76,54 +82,90 @@ inline bool solve2x2(float a11, float a12, float a21, float a22,
   return true;
 }
 
+// From series/shunt rates and Ts, build continuous A,B then ZOH → Ad,Bd.
+// Handles near-singular A with a series fallback.
+inline DiscreteAB zoh_discretize_from_rates(
+    float series_fast, float series_slow,  // attack series rates
+    float shunt_fast,  float shunt_slow,   // shunt rates
+    float Ts)
+{
+  // Continuous-time A and B
+  const float a11 = -(series_fast + shunt_fast);
+  const float a12 = -series_fast;
+  const float a21 = -series_slow;
+  const float a22 = -(series_slow + shunt_slow);
+  const float b1  = series_fast;
+  const float b2  = series_slow;
+
+  // expm(A*Ts) via 2x2 closed-form
+  float Ad11, Ad12, Ad21, Ad22;
+  expm2x2(Ts * a11, Ts * a12, Ts * a21, Ts * a22, Ad11, Ad12, Ad21, Ad22);
+
+  // Bd = A^{-1} (Ad - I) B, with safe fallback
+  const float rhs1 = (Ad11 - 1.0f) * b1 + Ad12 * b2;
+  const float rhs2 = Ad21 * b1 + (Ad22 - 1.0f) * b2;
+  float Bd1, Bd2;
+  if (!solve2x2(a11, a12, a21, a22, rhs1, rhs2, Bd1, Bd2)) {
+    // Series fallback: Bd ≈ Ts*b + 0.5*Ts^2*A*b
+    const float AB1 = a11 * b1 + a12 * b2;
+    const float AB2 = a21 * b1 + a22 * b2;
+    Bd1 = Ts * b1 + 0.5f * Ts * Ts * AB1;
+    Bd2 = Ts * b2 + 0.5f * Ts * Ts * AB2;
+  }
+  return {Ad11, Ad12, Ad21, Ad22, Bd1, Bd2};
+}
+
 }  // namespace
 
 // Forward API
 // Inputs (CPU float32 contiguous):
-//   g_raw_db: (B, T) target gain in dB (<= 0 typically)
+//   x_peak_dB: (B, T) input signal - 20log10(abs(x))
 //   T_af, T_as, T_sf, T_ss: (B,) positive time constants (seconds)
-//   k: gate sharpness (scalar)
+//   comp_slope: (B,)  compressor slope
+//   comp_thresh: (B,) compressor threshold
+//   feedback_coeff: (B,) feedback coefficient
+//   k: (B,) gate sharpness
 //   fs: sample rate (scalar Hz)
 // Output: y_db: (B, T) smoothed gain in dB
 
-
 torch::Tensor ssl_smoother_forward(
     const torch::Tensor& x_peak_dB_in,
-    const torch::Tensor& T_af_in,
-    const torch::Tensor& T_as_in,
-    const torch::Tensor& T_sf_in,
-    const torch::Tensor& T_ss_in,
+    const torch::Tensor& T_attack_fast_in,
+    const torch::Tensor& T_attack_slow_in,
+    const torch::Tensor& T_shunt_fast_in,
+    const torch::Tensor& T_shunt_slow_in,
     const torch::Tensor& comp_slope_in,
     const torch::Tensor& comp_thresh_in,
     const torch::Tensor& feedback_coeff_in,
     const torch::Tensor& k_in,
-    double fs) {
-  TORCH_CHECK(x_peak_dB_in.device().is_cpu(), "ssl_smoother_forward: CPU tensor expected for g_raw_db");
-  TORCH_CHECK(x_peak_dB_in.dtype() == torch::kFloat, "ssl_smoother_forward: float32 expected for g_raw_db");
-  TORCH_CHECK(x_peak_dB_in.dim() == 2, "g_raw_db must be (B,T)");
-  TORCH_CHECK(T_af_in.device().is_cpu() && T_as_in.device().is_cpu() &&
-                  T_sf_in.device().is_cpu() && T_ss_in.device().is_cpu() && comp_slope_in.device().is_cpu() && comp_thresh_in.device().is_cpu() && feedback_coeff_in.device().is_cpu() && k_in.device().is_cpu(),
+    const double fs,
+    const bool soft_gate) {
+  TORCH_CHECK(x_peak_dB_in.device().is_cpu(), "ssl_smoother_forward: CPU tensor expected for x_peak_dB");
+  TORCH_CHECK(x_peak_dB_in.dtype() == torch::kFloat, "ssl_smoother_forward: float32 expected for x_peak_dB");
+  TORCH_CHECK(x_peak_dB_in.dim() == 2, "x_peak_dB must be (B,T)");
+  TORCH_CHECK(T_attack_fast_in.device().is_cpu() && T_attack_slow_in.device().is_cpu() &&
+                  T_shunt_fast_in.device().is_cpu() && T_shunt_slow_in.device().is_cpu() && comp_slope_in.device().is_cpu() && comp_thresh_in.device().is_cpu() && feedback_coeff_in.device().is_cpu() && k_in.device().is_cpu(),
               "time constant tensors must be on CPU");
-  TORCH_CHECK(T_af_in.dtype() == torch::kFloat && T_as_in.dtype() == torch::kFloat &&
-                  T_sf_in.dtype() == torch::kFloat && T_ss_in.dtype() == torch::kFloat && comp_slope_in.dtype() == torch::kFloat && comp_thresh_in.dtype() == torch::kFloat && feedback_coeff_in.dtype() == torch::kFloat && k_in.dtype() == torch::kFloat,
+  TORCH_CHECK(T_attack_fast_in.dtype() == torch::kFloat && T_attack_slow_in.dtype() == torch::kFloat &&
+                  T_shunt_fast_in.dtype() == torch::kFloat && T_shunt_slow_in.dtype() == torch::kFloat && comp_slope_in.dtype() == torch::kFloat && comp_thresh_in.dtype() == torch::kFloat && feedback_coeff_in.dtype() == torch::kFloat && k_in.dtype() == torch::kFloat,
               "time constant tensors must be float32");
-  TORCH_CHECK(T_af_in.dim() == 1 && T_as_in.dim() == 1 && T_sf_in.dim() == 1 && T_ss_in.dim() == 1 && comp_slope_in.dim() == 1 && comp_thresh_in.dim() == 1 && feedback_coeff_in.dim() == 1 && k_in.dim() == 1,
+  TORCH_CHECK(T_attack_fast_in.dim() == 1 && T_attack_slow_in.dim() == 1 && T_shunt_fast_in.dim() == 1 && T_shunt_slow_in.dim() == 1 && comp_slope_in.dim() == 1 && comp_thresh_in.dim() == 1 && feedback_coeff_in.dim() == 1 && k_in.dim() == 1,
               "time constant tensors must be (B,)");
 
   const auto B = static_cast<int64_t>(x_peak_dB_in.size(0));
   const auto T = static_cast<int64_t>(x_peak_dB_in.size(1));
-  TORCH_CHECK(T_af_in.size(0) == B && T_as_in.size(0) == B && T_sf_in.size(0) == B && T_ss_in.size(0) == B && comp_slope_in.size(0) == B && comp_thresh_in.size(0) == B && feedback_coeff_in.size(0) == B && k_in.size(0) == B,
+  TORCH_CHECK(T_attack_fast_in.size(0) == B && T_attack_slow_in.size(0) == B && T_shunt_fast_in.size(0) == B && T_shunt_slow_in.size(0) == B && comp_slope_in.size(0) == B && comp_thresh_in.size(0) == B && feedback_coeff_in.size(0) == B && k_in.size(0) == B,
               "time constant batch sizes must match B");
 
-  auto x_peak_dB = x_peak_dB_in.contiguous();
-  auto T_af = T_af_in.contiguous();
-  auto T_as = T_as_in.contiguous();
-  auto T_sf = T_sf_in.contiguous();
-  auto T_ss = T_ss_in.contiguous();
-  auto comp_slope = comp_slope_in.contiguous();
-  auto comp_thresh = comp_thresh_in.contiguous();
-  auto feedback_coeff = feedback_coeff_in.contiguous();
-  auto k = k_in.contiguous();
+  const auto x_peak_dB = x_peak_dB_in.contiguous();
+  const auto T_attack_fast = T_attack_fast_in.contiguous();
+  const auto T_attack_slow = T_attack_slow_in.contiguous();
+  const auto T_shunt_fast = T_shunt_fast_in.contiguous();
+  const auto T_shunt_slow = T_shunt_slow_in.contiguous();
+  const auto comp_slope = comp_slope_in.contiguous();
+  const auto comp_thresh = comp_thresh_in.contiguous();
+  const auto feedback_coeff = feedback_coeff_in.contiguous();
+  const auto k = k_in.contiguous();
   auto y_db = torch::empty_like(x_peak_dB);
 
   const float Ts = 1.0f / static_cast<float>(fs);
@@ -139,19 +181,29 @@ torch::Tensor ssl_smoother_forward(
       const float kf = k.data_ptr<float>()[b];
 
       // Convert time constants to rates (positive)
-      const float Taf = std::max(T_af.data_ptr<float>()[b], 1e-12f);
-      const float Tas = std::max(T_as.data_ptr<float>()[b], 1e-12f);
-      const float Tsf = std::max(T_sf.data_ptr<float>()[b], 1e-12f);
-      const float Tss = std::max(T_ss.data_ptr<float>()[b], 1e-12f);
-      const float af_r = 1.0f / Taf;
-      const float as_r = 1.0f / Tas;
-      const float sf_r = 1.0f / Tsf;
-      const float ss_r = 1.0f / Tss;
+      const float T_attack_fast_f = std::max(T_attack_fast.data_ptr<float>()[b], 1e-12f);
+      const float T_attack_slow_f = std::max(T_attack_slow.data_ptr<float>()[b], 1e-12f);
+      const float T_shunt_fast_f = std::max(T_shunt_fast.data_ptr<float>()[b], 1e-12f);
+      const float T_shunt_slow_f = std::max(T_shunt_slow.data_ptr<float>()[b], 1e-12f);
+      const float R_attack_fast = 1.0f / T_attack_fast_f;
+      const float R_attack_slow = 1.0f / T_attack_slow_f;
+      const float R_shunt_fast = 1.0f / T_shunt_fast_f;
+      const float R_shunt_slow = 1.0f / T_shunt_slow_f;
 
       // Two-state vector (x1, x2) in dB-domain representation
       float x1 = 0.0f;
       float x2 = 0.0f;
       float y_prev = 0.0f;  // 0 dB = unity
+
+      DiscreteAB AB = {};
+      DiscreteAB AB_attack = {};
+      DiscreteAB AB_release = {};
+
+      if (!soft_gate)
+      {
+        AB_attack = zoh_discretize_from_rates(R_attack_fast, R_attack_slow, R_shunt_fast, R_shunt_slow, Ts);
+        AB_release = zoh_discretize_from_rates(0.f, 0.f, R_shunt_fast, R_shunt_slow, Ts);
+      }
 
       for (int64_t t = 0; t < T; ++t) {
         const float x_dB_now = x_ptr[t] + y_prev * fb_f; // apply feedback
@@ -159,37 +211,32 @@ torch::Tensor ssl_smoother_forward(
         if (gain_raw_db > 0.0f) {
             gain_raw_db = 0.0f;
         }
-        const float s = stable_sigmoid(kf * (gain_raw_db - y_prev));
-        const float series_f = (1.0f - s) * af_r;
-        const float series_s = (1.0f - s) * as_r;
 
-        // Continuous-time A and B for this step
-        const float a11 = -(series_f + sf_r);
-        const float a12 = -series_f;
-        const float a21 = -series_s;
-        const float a22 = -(series_s + ss_r);
-        const float b1 = series_f;
-        const float b2 = series_s;
+        const auto delta = gain_raw_db - y_prev;
 
-        // Discretize with exact ZOH using closed-form expm for 2x2
-        float Ad11, Ad12, Ad21, Ad22;
-        expm2x2(Ts * a11, Ts * a12, Ts * a21, Ts * a22, Ad11, Ad12, Ad21, Ad22);
+        if (soft_gate)
+        {
+          const float s = stable_sigmoid(kf * delta);
+          const float series_fast = (1.0f - s) * R_attack_fast;
+          const float series_slow = (1.0f - s) * R_attack_slow;
 
-        // Bd = A^{-1} (Ad - I) B, with fallback series if singular
-        const float rhs1 = (Ad11 - 1.0f) * b1 + Ad12 * b2;
-        const float rhs2 = Ad21 * b1 + (Ad22 - 1.0f) * b2;
-        float Bd1, Bd2;
-        if (!solve2x2(a11, a12, a21, a22, rhs1, rhs2, Bd1, Bd2)) {
-          // Series fallback: Bd ≈ Ts*b + 0.5*Ts^2*A*b
-          const float AB1 = a11 * b1 + a12 * b2;
-          const float AB2 = a21 * b1 + a22 * b2;
-          Bd1 = Ts * b1 + 0.5f * Ts * Ts * AB1;
-          Bd2 = Ts * b2 + 0.5f * Ts * Ts * AB2;
+          AB = zoh_discretize_from_rates(series_fast, series_slow, R_shunt_fast, R_shunt_slow, Ts);
+        }
+        else
+        {
+          if (delta < 0.0f)
+          {
+            AB = AB_attack;
+          }
+          else
+          {
+            AB = AB_release;
+          }
         }
 
         // State update
-        const float nx1 = Ad11 * x1 + Ad12 * x2 + Bd1 * gain_raw_db;
-        const float nx2 = Ad21 * x1 + Ad22 * x2 + Bd2 * gain_raw_db;
+        const float nx1 = AB.Ad11 * x1 + AB.Ad12 * x2 + AB.Bd1 * gain_raw_db;
+        const float nx2 = AB.Ad21 * x1 + AB.Ad22 * x2 + AB.Bd2 * gain_raw_db;
         x1 = nx1;
         x2 = nx2;
         const float y_t = x1 + x2;  // [1 1] x

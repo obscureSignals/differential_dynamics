@@ -14,13 +14,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Tuple
 
 import torch
-from torch.utils.cpp_extension import load
-import shutil
 from torch.autograd import Function
+from torch.utils.cpp_extension import load
 
 
 def _truthy_env(v: str | None) -> bool:
@@ -101,6 +101,7 @@ class SSL2StateSmootherFunction(Function):
         feedback_coeff: torch.Tensor,  # (B,),
         k: torch.Tensor,  # (B,),
         fs: float,
+        soft_gate: bool,
     ) -> torch.Tensor:
         if x_peak_dB.device.type != "cpu":
             raise RuntimeError("SSL2StateSmootherFunction: CPU tensors required")
@@ -133,6 +134,7 @@ class SSL2StateSmootherFunction(Function):
             feedback_coeff,
             k,
             float(fs),
+            soft_gate,
         )
         # Save tensors for backward implementation later
         ctx.save_for_backward(
@@ -167,6 +169,7 @@ def ssl2_smoother(
     feedback_coeff: torch.Tensor,
     k: torch.Tensor,
     fs: float,
+    soft_gate: bool,
 ) -> torch.Tensor:
     """Convenience wrapper: forward-only SSL 2-state smoother on CPU.
 
@@ -183,4 +186,5 @@ def ssl2_smoother(
         feedback_coeff,
         k,
         fs,
+        soft_gate,
     )

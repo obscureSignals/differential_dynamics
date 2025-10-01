@@ -327,6 +327,7 @@ def SSL_comp_gain(
     k: Union[torch.Tensor, float],
     feedback_coeff: Union[torch.Tensor, float],
     fs: float,
+    soft_gate: bool,
 ) -> torch.Tensor:
     """
     SSL-style compressor gain function
@@ -369,5 +370,6 @@ def SSL_comp_gain(
         feedback_coeff=feedback_coeff_t,
         k=k_t,
         fs=fs,
+        soft_gate=soft_gate,
     )
     return y_db

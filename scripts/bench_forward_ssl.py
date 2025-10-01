@@ -32,6 +32,7 @@ with torch.no_grad():
         release_time_slow_ms: float,
         feedback_coeff: float,
         k: float,
+        soft_gate: bool,
         test_file_path: str = None,
     ):
 
@@ -96,6 +97,7 @@ with torch.no_grad():
             feedback_coeff=feedback_coeff,
             k=k,
             fs=fs,
+            soft_gate=soft_gate,
         )
 
         # Plot gain traces
@@ -226,6 +228,12 @@ if __name__ == "__main__":
         default=0.5,
         help="Feedback coefficient, 0 to 1",
     )
+    p.add_argument(
+        "--soft-gate",
+        type=bool,
+        default=False,
+        help="Soft gate (True) or hard gate (False)",
+    )
 
     args = p.parse_args()
 
@@ -247,5 +255,6 @@ if __name__ == "__main__":
         release_time_slow_ms=args.release_time_slow_ms,
         feedback_coeff=args.feedback_coeff,
         k=args.k,
+        soft_gate=args.soft_gate,
         test_file_path=args.test_file_path,
     )

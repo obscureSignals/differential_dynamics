@@ -1,23 +1,5 @@
 /Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_MAKE_PROGRAM=/Applications/CLion.app/Contents/bin/ninja/mac/aarch64/ninja -G Ninja -DPython_EXECUTABLE=/Users/bthomp23/PycharmProjects/differential_dynamics/.venv/bin/python -DPython3_EXECUTABLE=/Users/bthomp23/PycharmProjects/differential_dynamics/.venv/bin/python -S /Users/bthomp23/PycharmProjects/differential_dynamics -B /Users/bthomp23/PycharmProjects/differential_dynamics/cmake-build-debug
--- The C compiler identification is AppleClang 16.0.0.16000026
--- The CXX compiler identification is AppleClang 16.0.0.16000026
--- Detecting C compiler ABI info
--- Detecting C compiler ABI info - done
--- Check for working C compiler: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc - skipped
--- Detecting C compile features
--- Detecting C compile features - done
--- Detecting CXX compiler ABI info
--- Detecting CXX compiler ABI info - done
--- Check for working CXX compiler: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ - skipped
--- Detecting CXX compile features
--- Detecting CXX compile features - done
--- Configuring done (15.3s)
+-- Found Python3: /opt/anaconda3/include/python3.12 (found version "3.12.2") found components: Development Development.Module Development.Embed
+-- Configuring done (2.6s)
 -- Generating done (0.0s)
-CMake Warning:
-  Manually-specified variables were not used by the project:
-
-    Python3_EXECUTABLE
-    Python_EXECUTABLE
-
-
 -- Build files have been written to: /Users/bthomp23/PycharmProjects/differential_dynamics/cmake-build-debug

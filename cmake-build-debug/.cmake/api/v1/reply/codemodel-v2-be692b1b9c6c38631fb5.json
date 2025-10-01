@@ -9,7 +9,7 @@
 					"jsonFile" : "directory-.-Debug-f5ebdc15457944623624.json",
 					"minimumCMakeVersion" : 
 					{
-						"string" : "3.29"
+						"string" : "3.20"
 					},
 					"projectIndex" : 0,
 					"source" : ".",
@@ -27,7 +27,7 @@
 					[
 						0
 					],
-					"name" : "differential_dynamics",
+					"name" : "ssl_smoother_ext",
 					"targetIndexes" : 
 					[
 						0
@@ -38,9 +38,9 @@
 			[
 				{
 					"directoryIndex" : 0,
-					"id" : "differential_dynamics::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-differential_dynamics-Debug-f71697c2d7a3e786ccd8.json",
-					"name" : "differential_dynamics",
+					"id" : "ssl_smoother_cpu_dbg::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ssl_smoother_cpu_dbg-Debug-d327fd773a95ed989bf3.json",
+					"name" : "ssl_smoother_cpu_dbg",
 					"projectIndex" : 0
 				}
 			]
