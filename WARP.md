@@ -4,6 +4,16 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 
 Repository: differential_dynamics — research code for differentiable dynamic range processing. The package includes a PyTorch backend for compressor/expander gain with switchable attack/release gating modes, classical baselines, benchmarking utilities, and a vendored third_party torchcomp_core.
 
+State of the union (2025-10-08)
+- Current focus: Differentiable SSL-style compressor operating entirely in the dB domain, with auto-release (dual time constants) and t-1 sidechain feedback.
+- Implementation status: Forward path done; CPU backward implemented with analytic adjoints for most parameters and finite-difference gradients for time constants. Verified by unit tests.
+- Key files:
+  - differential_dynamics/backends/torch/gain.py (SSL_comp_gain entry)
+  - differential_dynamics/backends/torch/ssl_smoother_ext.py (autograd wrapper)
+  - csrc/ssl_smoother.cpp (CPU kernel)
+  - tests/test_ssl_smoother_backward.py (gradient tests)
+- Reference/ground truth: docs/ssl_auto_release.md and the MATLAB formulation retained there.
+
 Commands
 
 - Environment and install (Python >= 3.9)
@@ -28,17 +38,21 @@ Commands
     ```
 
 - Tests
-  - This repo does not define top-level tests. Vendored tests live in third_party/torchcomp_core/tests and import the top-level module torchcomp.
-  - To run those tests, install the vendored torchcomp_core as a package so torchcomp is importable:
+  - Repo tests (SSL smoother gradients):
     ```bash path=null start=null
-    python -m pip install -e third_party/torchcomp_core
-    pytest -q third_party/torchcomp_core/tests
+    pytest -q tests/test_ssl_smoother_backward.py
     ```
-  - Run a single test file or test function:
-    ```bash path=null start=null
-    pytest -q third_party/torchcomp_core/tests/test_grad.py
-    pytest -q third_party/torchcomp_core/tests/test_grad.py::test_low_order_cpu
-    ```
+  - Vendored tests (torchcomp_core):
+    - Install the vendored torchcomp_core as a package so torchcomp is importable:
+      ```bash path=null start=null
+      python -m pip install -e third_party/torchcomp_core
+      pytest -q third_party/torchcomp_core/tests
+      ```
+    - Run a single vendored test file or function:
+      ```bash path=null start=null
+      pytest -q third_party/torchcomp_core/tests/test_grad.py
+      pytest -q third_party/torchcomp_core/tests/test_grad.py::test_low_order_cpu
+      ```
 
 - Benchmark script
   - Compare classical vs differentiable gating envelopes and plot gain traces. Requires matplotlib, torchaudio.

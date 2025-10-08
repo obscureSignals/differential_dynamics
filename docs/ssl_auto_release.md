@@ -1,5 +1,19 @@
 # SSL Auto-Release (series of parallel RC sections): hard-gate state-space ground truth
 
+Current implementation status (2025-10-08)
+- Domain: end-to-end dB domain (VCA control is linear in dB). Static curve computed in dB and clamped to <= 0 dB.
+- Feedback topology: t-1 feedback (detector sees previous-sample output gain in dB), matching MATLAB ground truth.
+- Forward path: implemented as a fused CPU kernel; ZOH discretization per mode (attack/release) with shared state basis.
+- Backward path: analytic reverse-scan for comp_slope, comp_thresh, feedback coefficient, and input; finite-difference gradients for the four time constants (T_af, T_as, T_sf, T_ss), epsilon tuned to tests.
+- Tests: gradient parity vs finite differences in tests/test_ssl_smoother_backward.py.
+- Code entry points: differential_dynamics/backends/torch/ssl_smoother_ext.py (autograd wrapper), csrc/ssl_smoother.cpp (CPU kernel), and differential_dynamics/backends/torch/gain.py::SSL_comp_gain.
+- MATLAB provenance: see the example loop and zoh_discretize_step pattern below; our implementation matches the structure and timing.
+
+Next steps
+- Build a parameter-recovery script that uses SSL_comp_gain with a dB-domain loss on gain traces.
+- Add a configurable switch for time-constant gradient method and epsilon.
+- Explore analytic gradients for time constants to replace FD for efficiency and stability.
+
 This document specifies the exact state-space model and per-sample hard-gate algorithm that reproduce the analog SSL Auto release behavior. It matches the proven MATLAB reference and is the source of truth for subsequent implementations (sigmoid gate, Python forward/backward).
 
 Sections

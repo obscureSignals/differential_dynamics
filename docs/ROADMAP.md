@@ -1,5 +1,17 @@
 # Differential Dynamics: Project Roadmap
 
+Status update (2025-10-08)
+- New goal: Differentiable SSL-style compressor (auto-release dual RC ladder), peak detector, and sidechain feedback operating entirely in the dB domain.
+- Current state: Forward path implemented; CPU backward implemented with analytic adjoints for most parameters and finite-difference gradients for the time constants. Verified by tests in tests/test_ssl_smoother_backward.py. Parameter-recovery training script is not yet implemented.
+- Next steps (near term):
+  - Add a parameter-recovery experiment (script + minimal nn.Module wrapper around SSL_comp_gain/ssl2_smoother) with dB-domain loss.
+  - Expose toggles for time-constant gradient method (FD vs analytic) and epsilon.
+  - Optional: surrogate gradients around the hard A/R gate if needed (forward remains hard).
+  - Longer term: analytic gradients for time constants in the fused backward.
+
+Note on archived content
+- The remainder of this file includes the earlier roadmap targeting a generic compexp_gain_mode with hard vs sigmoid gates. Those sections are retained for context and marked as archived where applicable. Prefer the SSL-specific docs in docs/ssl_auto_release.md for ground truth.
+
 This document captures the plan for building, benchmarking, and publishing a differentiable compressor suite with switchable attack/release (A/R) gating variants.
 
 ## Goals

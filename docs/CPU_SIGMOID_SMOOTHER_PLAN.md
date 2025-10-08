@@ -1,3 +1,12 @@
+# Status update (2025-10-08)
+
+- Current focus has shifted to a differentiable SSL-style compressor that operates fully in the dB domain, with auto-release (dual time constants), t-1 sidechain feedback, and a fused CPU kernel.
+- This document describes a one-pole, sigmoid-gated smoother plan that is now deprioritized. It is kept for future research and as a reference.
+- If we revisit a sigmoid gate, it will likely be applied within the SSL two-state ladder by blending series conductances per sample and re-discretizing via ZOH each step; see docs/ssl_auto_release.md for the SSL ground truth.
+- Forward is solid in the SSL path; backward currently uses finite differences for time constants and analytic adjoints for other parameters. See tests in tests/test_ssl_smoother_backward.py.
+
+---
+
 # CPU Sigmoid Smoother (C++ custom autograd) — Plan
 
 Goal
