@@ -111,7 +111,8 @@ def beating_tones(
     """
     t = torch.arange(T).float() / fs
     x = 0.5 * (
-        torch.sin(2 * math.pi * base_hz * t) + torch.sin(2 * math.pi * (base_hz + beat_hz) * t)
+        torch.sin(2 * math.pi * base_hz * t)
+        + torch.sin(2 * math.pi * (base_hz + beat_hz) * t)
     )
     return amp * x[None, :].repeat(B, 1)
 
@@ -193,14 +194,24 @@ def composite_program(
             ampv = rng.uniform(0.3, 0.9)
             # one burst at random place inside seg
             start = rng.uniform(0.1, 0.6)
-            seg = burst(fs=fs, T=dur_samp, B=B, start=start, dur=0.3, amp=ampv, freq=freq)
+            seg = burst(
+                fs=fs, T=dur_samp, B=B, start=start, dur=0.3, amp=ampv, freq=freq
+            )
         elif seg_type == "am":
             dur_samp = int(rng.uniform(0.2, 0.8) * fs)
             carrier = rng.uniform(200.0, 3000.0)
             rate = rng.uniform(1.0, 8.0)
             depth = rng.uniform(0.2, 0.8)
             ampv = rng.uniform(0.2, 0.8)
-            seg = am_tone(fs=fs, T=dur_samp, B=B, carrier_hz=carrier, am_hz=rate, depth=depth, amp=ampv)
+            seg = am_tone(
+                fs=fs,
+                T=dur_samp,
+                B=B,
+                carrier_hz=carrier,
+                am_hz=rate,
+                depth=depth,
+                amp=ampv,
+            )
         elif seg_type == "noise":
             dur_samp = int(rng.uniform(0.1, 0.6) * fs)
             ampv = rng.uniform(0.05, 0.3)

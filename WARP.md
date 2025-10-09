@@ -16,7 +16,7 @@ State of the union (2025-10-08)
 
 Commands
 
-- Environment and install (Python >= 3.9)
+- Environment and install (Python >= 3.10)
   - Create venv and install the package in editable mode
     ```bash path=null start=null
     python -m venv .venv

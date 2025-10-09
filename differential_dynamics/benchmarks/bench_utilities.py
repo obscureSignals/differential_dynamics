@@ -1,12 +1,15 @@
 import torch
 from torchaudio.functional import lfilter
 import numpy as np
+
 try:
     from numba import njit
 except Exception:  # numba is optional at runtime
+
     def njit(*args, **kwargs):
         def wrap(f):
             return f
+
         return wrap
 
 
@@ -15,6 +18,13 @@ def gain_db(g: torch.Tensor, eps_amp: float = 1e-7) -> torch.Tensor:
     g: (B,T)
     """
     return 20.0 * torch.log10(torch.clamp(g, min=eps_amp))
+
+
+def db_gain(db: torch.Tensor) -> torch.Tensor:
+    """Convert dB to linear gain.
+    g: (B,T)
+    """
+    return torch.pow(10.0, db / 20.0)
 
 
 @njit(cache=True)

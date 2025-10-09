@@ -3,10 +3,6 @@
 // Forward implements a per-sample Zero-Order Hold (ZOH) discretization of a
 // 2x2 continuous-time system with gate-blended series rates. The gate operates
 // in the dB domain: s = sigmoid(k * (g_db - y_prev_db)). Output is y_db.
-//
-// Backward is intentionally left unimplemented for now and will fail loudly.
-// A single reverse scan accumulating gradients w.r.t. inputs and parameters
-// will be added next.
 
 #include <ATen/Parallel.h>
 #include <torch/extension.h>
