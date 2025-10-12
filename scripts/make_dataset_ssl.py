@@ -154,24 +154,6 @@ def sample_theta(
     )
 
 
-def synth_clip(kind: str, fs: int, T: int) -> torch.Tensor:
-    """Legacy primitive generators (kept for variety). Returns (1, T).
-
-    Note: most synthetic content should come from composite_program() to avoid
-    template leakage across splits. These primitives can still be sprinkled in
-    as additional variety during early experiments.
-    """
-    if kind == "tone":
-        return tone(freq=1000.0, fs=fs, T=T, B=1, amp=0.5)
-    if kind == "step":
-        return step_sig(fs=fs, T=T, B=1, at=0.25, amp_before=0.05, amp_after=0.8)
-    if kind == "burst":
-        return burst(fs=fs, T=T, B=1, start=0.2, dur=0.1, amp=0.8, freq=1000.0)
-    if kind == "ramp":
-        return ramp(fs=fs, T=T, B=1, start=0.2, dur=0.5, a0=0.1, a1=0.8)
-    raise ValueError(f"Unknown synth kind: {kind}")
-
-
 def process_example(
     x: torch.Tensor,
     fs: int,
@@ -388,7 +370,7 @@ def main():
     p.add_argument("--fs", type=int, default=44100, help="Sample rate (Hz)")
 
     p.add_argument(
-        "--clip-dur-s", type=float, default=2, help="Clip duration in seconds"
+        "--clip-dur-s", type=float, default=0.5, help="Clip duration in seconds"
     )
 
     # Optional per-clip normalization
@@ -462,7 +444,7 @@ def main():
     p.add_argument(
         "--music-frac",
         type=frac01,
-        default=0.5,
+        default=1,
         help="Fraction of clips per split to source from music (rest from synthetic), must be in [0,1]",
     )
 

@@ -9,6 +9,15 @@ Current implementation status (2025-10-08)
 - Code entry points: differential_dynamics/backends/torch/ssl_smoother_ext.py (autograd wrapper), csrc/ssl_smoother.cpp (CPU kernel), and differential_dynamics/backends/torch/gain.py::SSL_comp_gain.
 - MATLAB provenance: see the example loop and zoh_discretize_step pattern below; our implementation matches the structure and timing.
 
+Next steps (updated 2025-10-12)
+- Analytic Jacobians for Ad and Bd are implemented for the hard gate (attack/release) using:
+  - dBd: ZOH‑consistent linear‑solve formulation (A F = Ad − I; A dF = dAd − dA F; dBd = dF B + F dB)
+  - dAd: robust 12‑point Gauss–Legendre Frechet (default); block‑expm available via SSL_FRECHET_METHOD=b
+- Debug helpers available via the C++ extension:
+  - dbg_attack_dbd_compare (an vs double-FD)
+  - dbg_bd_from_rates, dbg_dbd_fd_with_eps, dbg_dbd_fd_sweep (double-precision FD baselines)
+- Training can now use analytic Jacobians by default; FD remains as a fallback for experiments.
+
 Next steps
 - Build a parameter-recovery script that uses SSL_comp_gain with a dB-domain loss on gain traces.
 - Add a configurable switch for time-constant gradient method and epsilon.

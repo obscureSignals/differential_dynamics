@@ -50,7 +50,8 @@ class ParamRecoveryModelSLL(nn.Module):
 
         # allow slow attack TC to go very large to simulate single time constant settings
         # 100x slowest ssl value
-        self.T_as_max = 270e3 * 6.8e-6 * 100
+        # self.T_as_max = 1.2e6 * 6.8e-6 * 1.2
+        self.T_as_max = 1e9 * 6.8e-6 * 1.2
 
         # +/- 20% on ssl values
         self.T_sf_min = 91e3 * 0.47e-6 * 0.8
@@ -59,7 +60,8 @@ class ParamRecoveryModelSLL(nn.Module):
 
         # allow slow shunt TC to go very large to simulate single time constant settings
         # 100x ssl value
-        self.T_ss_max = 750e3 * 6.8e-6 * 100
+        # self.T_ss_max = 750e3 * 6.8e-6 * 1.2
+        self.T_ss_max = 1e9 * 6.8e-6 * 1.2
 
         # Learnable parameters
         self.comp_thresh = nn.Parameter(

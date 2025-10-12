@@ -169,13 +169,19 @@ def composite_program(
     while t_cur < T and n_segs > 0:
         n_segs -= 1
         seg_type = rng.choices(
-            population=["step", "ramp", "burst", "am", "noise", "silence"],
-            weights=[0.2, 0.2, 0.2, 0.2, 0.15, 0.05],
+            population=["step", "ramp", "burst", "am", "noise", "silence", "probe"],
+            weights=[0.2, 0.2, 0.2, 0.2, 0.15, 0.05, 0.0],
+            # weights=[0.18, 0.18, 0.18, 0.18, 0.14, 0.04, 0.10],
             k=1,
         )[0]
         # Duration 30..300 ms (except silence 10..100 ms)
         if seg_type == "silence":
-            dur_samp = int(rng.uniform(0.01, 0.1) * fs)
+            # Mostly short rests, occasionally long silences (1–4 s) to expose slow release
+            if rng.random() < 0.25:
+                # dur_samp = int(rng.uniform(1.0, 4.0) * fs)
+                dur_samp = int(rng.uniform(0.01, 0.1) * fs)
+            else:
+                dur_samp = int(rng.uniform(0.01, 0.1) * fs)
             seg = torch.zeros(B, dur_samp)
         elif seg_type == "step":
             dur_samp = int(rng.uniform(0.05, 0.4) * fs)
@@ -216,6 +222,22 @@ def composite_program(
             dur_samp = int(rng.uniform(0.1, 0.6) * fs)
             ampv = rng.uniform(0.05, 0.3)
             seg = white_noise(fs=fs, T=dur_samp, B=B, amp=ampv)
+        elif seg_type == "probe":
+            # A→B→A pattern with unequal dwell times and potentially unequal return level
+            dA = int(rng.uniform(0.3, 1.5) * fs)
+            dB = int(rng.uniform(0.3, 1.5) * fs)
+            # Levels
+            aA1 = rng.uniform(0.02, 0.12)
+            aB = rng.uniform(0.6, 0.95)
+            # Return level may differ slightly from aA1 to create unequal step sizes
+            aA2 = rng.uniform(0.02, 0.12)
+            segA1 = torch.full((B, dA), float(aA1))
+            segB = torch.full((B, dB), float(aB))
+            # Choose a third plateau duration similar to dA but varied
+            dA2 = int(max(1, rng.uniform(0.7, 1.3) * dA))
+            segA2 = torch.full((B, dA2), float(aA2))
+            seg = torch.cat([segA1, segB, segA2], dim=1)
+            dur_samp = seg.shape[1]
         else:
             seg = torch.zeros(B, 0)
             dur_samp = 0
