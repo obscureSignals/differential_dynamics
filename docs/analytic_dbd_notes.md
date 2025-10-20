@@ -186,36 +186,78 @@ With these two changes, analytic dBd now matches a double‑precision Bd FD base
 
 ## Implementation details (as shipped)
 
-- Analytic dBd path (phi): linear‑solve formulation:
+- Analytic dBd path (phi): ZOH‑consistent linear‑solve formulation:
   - Compute Ad via expm2x2_double
   - Solve A F = (Ad − I)
-  - Compute dAd via Frechet‑quad (default) or FD (debug), then solve A dF = dAd − dA F
+  - Compute dAd via Frechet quadrature (12‑point Gauss–Legendre), then solve A dF = dAd − dA F
   - dBd = dF B + F dB
 - Analytic dAd path (Frechet): 12‑point Gauss–Legendre quadrature (default)
-  - env override SSL_FRECHET_METHOD=b enables the old block 4×4 method for experiments
-- Numeric Bd FD (baseline): always uses double‑precision Bd (expm2x2_double + solve2x2_double) in debug compares
+  - Optional debug: set SSL_AD_USE_FD=1 to compute dAd via finite differences instead of Frechet
+- Numeric Bd FD (baseline for debug): uses double‑precision Bd (expm2x2_double + solve2x2_double) when comparing raw dBd against FD
 
-## New debug utilities (C++ extension)
+### 2025‑10‑13 Cleanup and public controls
 
-- dbg_attack_dbd_compare(Raf,Ras,Rsf,Rss,Ts) → (4×4) rows per rate: [an_Bd1, an_Bd2, fd_Bd1, fd_Bd2]; FD uses double Bd baseline
-- dbg_attack_dbd_terms(Raf,Ras,Rsf,Rss,Ts) → (4×12) per‑term breakdown for left/right associations (useful historically; current path uses linear‑solve)
-- dbg_bd_from_rates(Raf,Ras,Rsf,Rss,Ts) → Bd in float (computed in double internally)
-- dbg_dbd_fd_with_eps(..., which, eps) → dBd FD at custom eps, in double
-- dbg_dbd_fd_sweep(..., which, eps0, decades, steps_per_decade) → table of [eps, dBd1, dBd2] to find stable FD plateaus
+- The analytic dBd backend is hardwired to the phi linear‑solve method; legacy integral and inverse variants were removed.
+- Two supported gradient modes in the kernel:
+  - Analytic operator‑Jacobian contraction (fixed mask, subgradient): uses phi linear‑solve for dBd and Frechet quadrature for dAd.
+  - Scalar‑loss finite difference (FD) for time‑constant gradients: event‑sensitive by default; optionally fixed‑mask replay.
+- Trainer interface: scripts/train_param_recovery_ssl.py exposes --solver={analytic,fd}
+  - --solver fd: sets SSL_USE_FD_TCONST_GRADS=1 and unsets analytic toggles.
+  - --solver analytic: sets SSL_USE_FD_TCONST_GRADS=0 and SSL_USE_ANALYTIC_JAC=1.
+- Note on event sensitivity: the analytic path is fixed‑mask (no event sensitivity to gate flips). FD with variable mask captures event sensitivity; FD with SSL_TCONST_FD_FIXED_MASK=1 replays a fixed mask consistent with the analytic subgradient.
+
+## Debug utilities exposed by the extension
+
+- dbg_attack_dbd_compare(Raf,Ras,Rsf,Rss,Ts): returns a 4×4 matrix with per‑rate columns [an_Bd1, an_Bd2, fd_Bd1, fd_Bd2]; FD uses a double‑precision Bd baseline
+- dbg_bd_from_rates(Raf,Ras,Rsf,Rss,Ts): Bd in float32 (computed in double internally)
+- dbg_dbd_fd_with_eps(Raf,Ras,Rsf,Rss,Ts, which, eps): FD dBd at custom epsilon (double precision)
+- dbg_dbd_fd_sweep(Raf,Ras,Rsf,Rss,Ts, which, eps0, decades, steps_per_decade): rows [eps, dBd1, dBd2] to locate stable FD plateaus
+
+Removed during cleanup:
+- dbg_attack_dbd_terms: per‑term breakdown removed to reduce surface area; retained higher‑level compares above
 
 ## Environment toggles (current)
 
-- SSL_SMOOTHER_DEBUG=1, SSL_SMOOTHER_FORCE_REBUILD=1: build/debug flags
-- SSL_ANALYTIC_BD_METHOD=phi|integral|inverse: select analytic dBd backend; phi is default and uses linear‑solve
-- SSL_AD_USE_FD=0|1: compute dAd via FD (debug) instead of Frechet; default 0
-- SSL_FRECHET_METHOD=b: force block‑expm Frechet (debug); default is quadrature
-- SSL_DEBUG_*: step traces and per‑rate prints (see kernel for full list)
+Build and caching:
+- SSL_SMOOTHER_DEBUG=1, SSL_SMOOTHER_FORCE_REBUILD=1
 
-Legacy/obsolete during the investigation
-- SSL_PHI_USE_LEFT, SSL_PHI_FLIP_SIGN: no longer needed; replaced by the linear‑solve formulation.
+Gradient mode selection:
+- SSL_USE_FD_TCONST_GRADS=1: use scalar‑loss FD for time‑constant gradients (default 0 = analytic operator Jacobians)
+- SSL_TCONST_FD_FIXED_MASK=1: replay fixed mask in FD mode (default 0 = event‑sensitive)
+- SSL_TCONST_FD_SUBSAMPLE=N: subsample steps in FD scalar‑loss evaluation (default 1)
+
+Analytic operator Jacobians (debug mixing):
+- SSL_USE_ANALYTIC_JAC=1: master toggle to enable analytic operator Jacobians for both Ad and Bd
+- SSL_USE_ANALYTIC_JAC_AD=0|1, SSL_USE_ANALYTIC_JAC_BD=0|1: override per‑operator to mix numeric/analytic for A/B
+- SSL_AD_USE_FD=1: compute dAd via finite differences instead of Frechet (debug only)
+
+Saltation (hard gate):
+- SSL_USE_SALTATION=1: enable saltation corrections at gate flips
+- SSL_SALTATION_EPS_REL, SSL_SALTATION_MAX_BACKOFF: numeric knobs for dα/d ln T
+- SSL_SALTATION_MAX_FLIPS: limit processed flips per backward
+- SSL_SALTATION_LOG_SUMMARY=1: one‑line smooth vs salt totals per batch 0
+- SSL_SALTATION_LOG_EVERY, SSL_SALTATION_LOG_MAX: throttle per‑flip logs
+- SSL_SALTATION_SIGN_TEST=1: invert sign of saltation to sanity‑check conventions
+
+Debug printing:
+- SSL_DEBUG_BD_RAW=1, SSL_DEBUG_AD_RAW=1, SSL_DEBUG_STEP_BD=1, SSL_DEBUG_PHI_TRACE=1
+- SSL_DEBUG_ONEHOT_T=t: print per‑step analytic decomposition and one‑hot FD at timestep t
+
+Notes:
+- The analytic dBd backend is hardwired to the phi linear‑solve. SSL_ANALYTIC_BD_METHOD and SSL_FRECHET_METHOD are ignored.
 
 ## Takeaways
 
 - Always validate at the raw operator level (dBd vs Bd FD) in double precision; float32 FD can be misleading at tiny eps.
 - ZOH‑consistent linear‑solve for dBd is simple, fast for 2×2, and unambiguous.
 - Quadrature‑based Frechet is robust and matches FD in practice; keep block‑expm as an optional fallback for experiments.
+
+---
+
+# 2025‑10‑20 Update: Clean analytic contraction, release‑branch structure, and saltation
+
+- No empirical scaling in gradients: no k_db or mean‑reduction factors. dL/dR is accumulated directly in the dB domain and chained to time constants via −dL/dR/T².
+- Per‑step one‑hot check: with SSL_DEBUG_ONEHOT_T set, the kernel prints the analytic per‑term dot products (Ad, Bd, Gamma) for a chosen timestep and the matching per‑step FD dR using L_step = y_t. This validated the Ad‑term contraction and exposed remaining issues.
+- Release‑branch structural exclusion: during release steps, series rates (Raf, Ras) do not affect the dynamics. Their contributions are excluded from dL/dR accumulation on release; only shunt rates (Rsf, Rss) contribute. This closed the residual gap in gT_as vs kernel FD.
+- Saltation (hard gate) implemented and optional (SSL_USE_SALTATION=1): computes flip location α via linear interpolation on δ = a − y_prev, contracts J = λ · d x_{t+1}/dα via a split‑step composition, and multiplies by dα/d ln T from a central‑difference with adaptive backoff. Summaries/log throttles are available (see toggles above).
+- Status: backward tests pass; forward vs FD dL/dR agrees; saltation contributions are small but non‑zero in typical cases.

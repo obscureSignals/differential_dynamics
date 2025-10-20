@@ -49,27 +49,29 @@ class ParamRecoveryModelSLL(nn.Module):
         self.T_as_min = 820 * 6.8e-6 * 0.8
 
         # allow slow attack TC to go very large to simulate single time constant settings
-        # 100x slowest ssl value
-        # self.T_as_max = 1.2e6 * 6.8e-6 * 1.2
-        self.T_as_max = 1e9 * 6.8e-6 * 1.2
+        self.T_as_max = 1e6
 
-        # +/- 20% on ssl values
+        # +/- 20% on ssl values (seconds)
         self.T_sf_min = 91e3 * 0.47e-6 * 0.8
         self.T_sf_max = 1.2e6 * 0.47e-6 * 1.2
-        self.T_ss_min = 750e3 * 6.8e-6 * 0.8
+        self.T_ss_max = 750e3 * 6.8e-6 * 1.2
 
-        # allow slow shunt TC to go very large to simulate single time constant settings
-        # 100x ssl value
-        # self.T_ss_max = 750e3 * 6.8e-6 * 1.2
-        self.T_ss_max = 1e9 * 6.8e-6 * 1.2
+        # Floor slow shunt TC to avoid numeric stiffness in forward/backward
+        self.T_ss_min = 1e-4
 
         # Learnable parameters
         self.comp_thresh = nn.Parameter(
             torch.tensor(float(init["CT"]), dtype=torch.float32)
         )
-        # Ratio as exp(logit)+1 to enforce >1
+        # Bounded ratio: r = 1 + (r_max - 1) * sigmoid(u)
+        # Match dataset ratios {2,4,10} to tighten the search space
+        self.ratio_rmax = 10.0
+        cr_init = float(init["CR"])  # > 1.0
+        cr_init = max(cr_init, 1.0001)
+        s_cr = (cr_init - 1.0) / (self.ratio_rmax - 1.0)
+        s_cr = min(max(s_cr, 1e-6), 1.0 - 1e-6)
         self.ratio_logit = nn.Parameter(
-            torch.log(torch.tensor(float(init["CR"])) - 1.0)
+            torch.logit(torch.tensor(s_cr, dtype=torch.float32))
         )
         # Feedback coeff via sigmoid(u) to [0,1]
         fb_init = float(init.get("FB", 0.5))
@@ -104,10 +106,11 @@ class ParamRecoveryModelSLL(nn.Module):
 
     def params_readable(self) -> Dict[str, float]:
         """Return current parameters in human units for logging/reporting."""
-        # Ratio
-        ratio_t = self.ratio_logit.exp() + 1.0
+        # Ratio (bounded)
+        s = torch.sigmoid(self.ratio_logit)
+        ratio_t = 1.0 + (self.ratio_rmax - 1.0) * s
         ratio_t = torch.nan_to_num(ratio_t, nan=torch.tensor(2.0, dtype=ratio_t.dtype))
-        ratio = float(torch.clamp_min(ratio_t, 1.0 + 1e-4).item())
+        ratio = float(torch.clamp(ratio_t, 1.0 + 1e-4, self.ratio_rmax).item())
         # Feedback
         fb = torch.sigmoid(self.fb_logit)
         fb = torch.nan_to_num(fb, nan=torch.tensor(0.5, dtype=fb.dtype))
@@ -140,10 +143,11 @@ class ParamRecoveryModelSLL(nn.Module):
             x_peak_dB = x_peak_dB.cpu()
         x_peak_dB = x_peak_dB.contiguous().float()
 
-        # Safe parameters
-        cr = self.ratio_logit.exp() + 1.0
+        # Safe parameters: ratio (bounded)
+        s = torch.sigmoid(self.ratio_logit)
+        cr = 1.0 + (self.ratio_rmax - 1.0) * s
         cr = torch.nan_to_num(cr, nan=torch.tensor(2.0, dtype=cr.dtype))
-        cr = torch.clamp_min(cr, 1.0 + 1e-4)
+        cr = torch.clamp(cr, 1.0 + 1e-4, self.ratio_rmax)
         fb = torch.sigmoid(self.fb_logit)
         fb = torch.nan_to_num(fb, nan=torch.tensor(0.5, dtype=fb.dtype))
         fb = torch.clamp(fb, 0.0, 1.0)

@@ -1,36 +1,8 @@
-/*
-Overview: SSL 2-state smoother (CPU, PyTorch extension)
-
-This file implements:
-- Forward pass (float32, CPU): per-sample Zero-Order Hold (ZOH) discretization of a
-  2x2 continuous-time system operating in the dB domain. In hard-gate mode, the branch is
-  selected by the sign of delta = a - y_prev (attack if delta < 0, release otherwise).
-  In soft-gate mode (not used in backward), a sigmoid blends the series rates.
-- Backward pass (hard gate only): fixed-mask adjoint through the discrete recurrence, with
-  operator-Jacobian contractions to accumulate dL/dAd and dL/dBd per step, and then chain to
-  dL/dR and dL/dT. Optional saltation terms capture within-sample gate-flip sensitivity.
-
-Key identities and design choices:
-- ZOH: Ad = exp(A Ts), Bd = ∫_0^Ts exp(τ A) B dτ = Φ1(A Ts) B, with A F = Ad - I and F = Φ1(A Ts).
-- Analytic operator Jacobians: dAd via Fréchet integral (12-pt Gauss–Legendre); dBd via
-  ZOH-consistent linear solves for dF (A dF = dAd - dA F) and dBd = dF B + F dB.
-- Hard-gate structure: the release branch uses series_fast = series_slow = 0. Therefore
-  release steps are structurally insensitive to Raf/Ras (series rates). This is enforced
-  in backward by excluding (Raf,Ras) contributions on release steps.
-- Units: everything is in the dB domain for state/input; gradients are accumulated directly
-  without empirical scaling. Time-constant gradients use the chain R=1/T: dL/dT = -dL/dR / T^2.
-
-Saltation (optional, hard gate only):
-- At flips (delta crosses 0 within a sample), an additional term dL/dα is contracted with
-  dα/d ln T using local delta sensitivities, where α ∈ (0,1) is the flip location. J = λ · d x_{t+1}/dα
-  is computed by a split-step composition; dα uses the closed-form derivative of
-  α = -δ_{t-1} / (δ_t - δ_{t-1}). This avoids heavy per-flip replays.
-
-Debug knobs (see docs): one-hot per-step dumps, raw operator Jacobian compares, saltation summaries.
-Performance notes:
-- Forward is O(BT). Backward (smooth) is O(BT). Saltation adds O(#flips) overhead using local
-  sensitivities; a flip cap is enforced to avoid pathological costs.
-*/
+// CPU SSL 2-state sigmoid-gated smoother (forward, backward stub)
+//
+// Forward implements a per-sample Zero-Order Hold (ZOH) discretization of a
+// 2x2 continuous-time system with gate-blended series rates. The gate operates
+// in the dB domain: s = sigmoid(k * (g_db - y_prev_db)). Output is y_db.
 
 #include <ATen/Parallel.h>
 #include <torch/extension.h>
@@ -502,51 +474,6 @@ inline void expm2x2_double(double A11, double A12, double A21, double A22,
   E22 = emu * (c + kappa * D22);
 }
 
-// Frechet of phi1(Z) for 2x2 via Gauss–Legendre quadrature on s in [0,1]
-inline void frechet_phi1_2x2_double(
-    double A11, double A12, double A21, double A22,
-    double dA11, double dA12, double dA21, double dA22,
-    double Ts,
-    double& dF11, double& dF12, double& dF21, double& dF22) {
-  // 12-point Gauss–Legendre nodes/weights on [-1,1]
-  static const double xi[12] = {
-    -0.981560647, -0.904117286, -0.769902674, -0.587317954,
-    -0.367831498, -0.125233406,  0.125233406,  0.367831498,
-     0.587317954,  0.769902674,  0.904117286,  0.981560647 };
-  static const double wi[12] = {
-     0.047175336,  0.106939326,  0.160078328,  0.203167427,
-     0.233492537,  0.249147046,  0.249147046,  0.233492537,
-     0.203167427,  0.160078328,  0.106939326,  0.047175336 };
-  // E = Ts * dA
-  const double E11 = Ts * dA11, E12 = Ts * dA12, E21 = Ts * dA21, E22 = Ts * dA22;
-  dF11 = dF12 = dF21 = dF22 = 0.0;
-  // Integrate L_phi1(Z)[E] = ∫_0^1 exp((1-s)Z) E exp(s Z) ds
-  for (int i = 0; i < 12; ++i) {
-    const double s = 0.5 * (xi[i] + 1.0);   // map to [0,1]
-    const double w = 0.5 * wi[i];
-    // Left exp: exp((1-s) * A * Ts)
-    double L11,L12,L21,L22;
-    expm2x2_double((1.0 - s) * Ts * A11, (1.0 - s) * Ts * A12,
-                   (1.0 - s) * Ts * A21, (1.0 - s) * Ts * A22,
-                   L11,L12,L21,L22);
-    // Right exp: exp(s * A * Ts)
-    double R11,R12,R21,R22;
-    expm2x2_double(s * Ts * A11, s * Ts * A12,
-                   s * Ts * A21, s * Ts * A22,
-                   R11,R12,R21,R22);
-    // mid = E * R
-    const double m11 = E11*R11 + E12*R21;
-    const double m12 = E11*R12 + E12*R22;
-    const double m21 = E21*R11 + E22*R21;
-    const double m22 = E21*R12 + E22*R22;
-    // contrib = L * mid
-    dF11 += w * (L11*m11 + L12*m21);
-    dF12 += w * (L11*m12 + L12*m22);
-    dF21 += w * (L21*m11 + L22*m21);
-    dF22 += w * (L21*m12 + L22*m22);
-  }
-}
-
 // Generic N x N double-precision matrix helpers and expm (Pade(6))
 inline void matN_identity(std::vector<double>& M, int N) {
   M.assign(N*N, 0.0);
@@ -674,45 +601,32 @@ inline void expmN_double(const std::vector<double>& A_in, std::vector<double>& E
 
 torch::Tensor ssl_smoother_forward(
     const torch::Tensor& x_peak_dB_in,
-    const torch::Tensor& T_attack_fast_in,
-    const torch::Tensor& T_attack_slow_in,
-    const torch::Tensor& T_shunt_fast_in,
-    const torch::Tensor& T_shunt_slow_in,
+    const torch::Tensor& alpha_a_in,
+    const torch::Tensor& alpha_r_in,
     const torch::Tensor& comp_slope_in,
     const torch::Tensor& comp_thresh_in,
     const torch::Tensor& feedback_coeff_in,
     const torch::Tensor& k_in,
-    const double fs,
     const bool soft_gate) {
   TORCH_CHECK(x_peak_dB_in.device().is_cpu(), "ssl_smoother_forward: CPU tensor expected for x_peak_dB");
   TORCH_CHECK(x_peak_dB_in.dtype() == torch::kFloat, "ssl_smoother_forward: float32 expected for x_peak_dB");
   TORCH_CHECK(x_peak_dB_in.dim() == 2, "x_peak_dB must be (B,T)");
-  TORCH_CHECK(T_attack_fast_in.device().is_cpu() && T_attack_slow_in.device().is_cpu() &&
-                  T_shunt_fast_in.device().is_cpu() && T_shunt_slow_in.device().is_cpu() && comp_slope_in.device().is_cpu() && comp_thresh_in.device().is_cpu() && feedback_coeff_in.device().is_cpu() && k_in.device().is_cpu(),
-              "time constant tensors must be on CPU");
-  TORCH_CHECK(T_attack_fast_in.dtype() == torch::kFloat && T_attack_slow_in.dtype() == torch::kFloat &&
-                  T_shunt_fast_in.dtype() == torch::kFloat && T_shunt_slow_in.dtype() == torch::kFloat && comp_slope_in.dtype() == torch::kFloat && comp_thresh_in.dtype() == torch::kFloat && feedback_coeff_in.dtype() == torch::kFloat && k_in.dtype() == torch::kFloat,
-              "time constant tensors must be float32");
-  TORCH_CHECK(T_attack_fast_in.dim() == 1 && T_attack_slow_in.dim() == 1 && T_shunt_fast_in.dim() == 1 && T_shunt_slow_in.dim() == 1 && comp_slope_in.dim() == 1 && comp_thresh_in.dim() == 1 && feedback_coeff_in.dim() == 1 && k_in.dim() == 1,
-              "time constant tensors must be (B,)");
+  TORCH_CHECK(alpha_a_in.device().is_cpu() && alpha_r_in.device().is_cpu(), "alpha tensors must be on CPU");
+  TORCH_CHECK(alpha_a_in.dtype() == torch::kFloat && alpha_r_in.dtype() == torch::kFloat, "alpha tensors must be float");
+  TORCH_CHECK(alpha_a_in.dim() == 1 && alpha_r_in.dim() == 1, "alpha tensors must be (B,)");
 
   const auto B = static_cast<int64_t>(x_peak_dB_in.size(0));
   const auto T = static_cast<int64_t>(x_peak_dB_in.size(1));
-  TORCH_CHECK(T_attack_fast_in.size(0) == B && T_attack_slow_in.size(0) == B && T_shunt_fast_in.size(0) == B && T_shunt_slow_in.size(0) == B && comp_slope_in.size(0) == B && comp_thresh_in.size(0) == B && feedback_coeff_in.size(0) == B && k_in.size(0) == B,
-              "time constant batch sizes must match B");
+  TORCH_CHECK(alpha_a_in.size(0) == B && alpha_r_in.size(0) == B, "alpha size mismatch with batch");
 
   const auto x_peak_dB = x_peak_dB_in.contiguous();
-  const auto T_attack_fast = T_attack_fast_in.contiguous();
-  const auto T_attack_slow = T_attack_slow_in.contiguous();
-  const auto T_shunt_fast = T_shunt_fast_in.contiguous();
-  const auto T_shunt_slow = T_shunt_slow_in.contiguous();
+  auto alpha_a = alpha_a_in.contiguous();
+  auto alpha_r = alpha_r_in.contiguous();
   const auto comp_slope = comp_slope_in.contiguous();
   const auto comp_thresh = comp_thresh_in.contiguous();
   const auto feedback_coeff = feedback_coeff_in.contiguous();
   const auto k = k_in.contiguous();
   auto y_db = torch::empty_like(x_peak_dB);
-
-  const float Ts = 1.0f / static_cast<float>(fs);
 
   at::parallel_for(0, B, 1, [&](int64_t b_begin, int64_t b_end) {
     for (int64_t b = b_begin; b < b_end; ++b) {
@@ -724,30 +638,10 @@ torch::Tensor ssl_smoother_forward(
       const float fb_f = feedback_coeff.data_ptr<float>()[b];
       const float kf = k.data_ptr<float>()[b];
 
-      // Convert time constants to rates (positive)
-      const float T_attack_fast_f = std::max(T_attack_fast.data_ptr<float>()[b], 1e-12f);
-      const float T_attack_slow_f = std::max(T_attack_slow.data_ptr<float>()[b], 1e-12f);
-      const float T_shunt_fast_f = std::max(T_shunt_fast.data_ptr<float>()[b], 1e-12f);
-      const float T_shunt_slow_f = std::max(T_shunt_slow.data_ptr<float>()[b], 1e-12f);
-      const float R_attack_fast = 1.0f / T_attack_fast_f;
-      const float R_attack_slow = 1.0f / T_attack_slow_f;
-      const float R_shunt_fast = 1.0f / T_shunt_fast_f;
-      const float R_shunt_slow = 1.0f / T_shunt_slow_f;
+      const float aa = alpha_a.data_ptr<float>()[b];
+      const float ar = alpha_r.data_ptr<float>()[b];
 
-      // Two-state vector (x1, x2) in dB-domain representation
-      float x1 = 0.0f;
-      float x2 = 0.0f;
       float y_prev = 0.0f;  // 0 dB = unity
-
-      DiscreteAB AB = {};
-      DiscreteAB AB_attack = {};
-      DiscreteAB AB_release = {};
-
-      if (!soft_gate)
-      {
-        AB_attack = zoh_discretize_from_rates(R_attack_fast, R_attack_slow, R_shunt_fast, R_shunt_slow, Ts);
-        AB_release = zoh_discretize_from_rates(0.f, 0.f, R_shunt_fast, R_shunt_slow, Ts);
-      }
 
       for (int64_t t = 0; t < T; ++t) {
         const float x_dB_now = x_ptr[t] + y_prev * fb_f; // apply feedback
@@ -758,38 +652,31 @@ torch::Tensor ssl_smoother_forward(
 
         const auto delta = gain_raw_db - y_prev;
 
+        float alpha_t;
+        float y_t;
+
         if (soft_gate)
         {
           const float s = stable_sigmoid(kf * delta);
-          const float series_fast = (1.0f - s) * R_attack_fast;
-          const float series_slow = (1.0f - s) * R_attack_slow;
-
-          AB = zoh_discretize_from_rates(series_fast, series_slow, R_shunt_fast, R_shunt_slow, Ts);
+          alpha_t = s * ar + (1.0f - s) * aa;
         }
         else
         {
           if (delta < 0.0f)
           {
-            AB = AB_attack;
+            alpha_t = aa;
           }
           else
           {
-            AB = AB_release;
+            alpha_t = ar;
           }
         }
-
-        // State update
-        const float nx1 = AB.Ad11 * x1 + AB.Ad12 * x2 + AB.Bd1 * gain_raw_db;
-        const float nx2 = AB.Ad21 * x1 + AB.Ad22 * x2 + AB.Bd2 * gain_raw_db;
-        x1 = nx1;
-        x2 = nx2;
-        const float y_t = x1 + x2;  // [1 1] x
+        y_t = (1.0f - alpha_t) * y_prev + alpha_t * gain_raw_db;
         y_ptr[t] = y_t;
         y_prev = y_t;
       }
     }
   });
-
   return y_db;
 }
 
@@ -807,6 +694,8 @@ inline DiscreteAB zoh_disc_rates_eps(float series_fast, float series_slow, float
   return zoh_discretize_from_rates(sf, ss, hf, hs, Ts);
 }
 
+// Numeric sensitivity of DiscreteAB wrt a single rate parameter q using central differences
+inline DiscreteAB zoh_disc_rates_eps(float series_fast, float series_slow, float shunt_fast, float shunt_slow, float Ts, int which, float eps);
 
 inline void numeric_dAB_drates(
   float series_fast, float series_slow, float shunt_fast, float shunt_slow,
@@ -875,12 +764,7 @@ inline void analytic_dAB_drates(
   // dAd via exact Frechet derivative helper
   auto dAd_via_frechet = [&](float dA11,float dA12,float dA21,float dA22,
                              float& dAd11,float& dAd12,float& dAd21,float& dAd22){
-    // Use robust double-precision quadrature-based Frechet for dAd
-    double A11=a11, A12=a12, A21=a21, A22=a22, Ts_d=Ts;
-    double dA11_d=dA11, dA12_d=dA12, dA21_d=dA21, dA22_d=dA22;
-    double dE11,dE12,dE21,dE22;
-    frechet_expm_2x2_double(A11,A12,A21,A22, dA11_d,dA12_d,dA21_d,dA22_d, Ts_d, dE11,dE12,dE21,dE22);
-    dAd11 = (float)dE11; dAd12 = (float)dE12; dAd21 = (float)dE21; dAd22 = (float)dE22;
+    frechet_expm_2x2(a11, a12, a21, a22, dA11, dA12, dA21, dA22, Ts, dAd11, dAd12, dAd21, dAd22);
   };
 
   // Compute Ad(Ts) and Phi1(A,Ts) by solving A * F = (Ad - I)
@@ -899,33 +783,67 @@ inline void analytic_dAB_drates(
     if (!solve2x2(a11,a12,a21,a22, rhs1,rhs2, F12,F22)) { F12 = 0.0f; F22 = Ts; }
   }
 
-  auto dBd_via_block = [&](float dA11_f,float dA12_f,float dA21_f,float dA22_f,
-                         float dB1_f,float dB2_f,
+  auto dBd_via_phi = [&](float dA11,float dA12,float dA21,float dA22,
+                         float dB1,float dB2,
                          float& oBd1,float& oBd2){
-    // Robust derivative of Bd using integral Frechet of phi1
-    const double A11=a11, A12=a12, A21=a21, A22=a22, Ts_d=Ts;
-    const double dA11=(double)dA11_f, dA12=(double)dA12_f, dA21=(double)dA21_f, dA22=(double)dA22_f;
-    const double b1_d=(double)b1, b2_d=(double)b2;
-    // Compute F = A^{-1}(Ad - I) via solve A F = (Ad - I)
+    // ZOH-consistent analytic derivative of Bd using linear solves.
+    // We use the identity Bd = F B with F = Phi1(A Ts), and A F = Ad - I.
+    // Differentiating A F = Ad - I gives A dF + dA F = dAd, so A dF = dAd - dA F.
+    // This reduces to two 2x2 linear solves (columnwise) for F and dF.
+    // Implementation steps:
+    // References:
+    // - Van Loan (1978): block-exp identity behind ZOH and Phi1.
+    // - Higham & Al-Mohy (2011): phi-functions; Phi1(Z) = Z^{-1} (exp(Z) - I) when Z invertible.
+    //  1) Compute Ad = exp(A Ts)
+    //  2) Solve A F = (Ad - I) for F (two 2x2 solves)
+    //  3) Compute dAd via Frechet (quadrature)
+    //  4) Solve A dF = dAd - dA F for dF (two 2x2 solves)
+    //  5) dBd = dF B + F dB
+    // Everything here is in double precision internally for stability and cast to float at exit.
+    double A11=a11, A12=a12, A21=a21, A22=a22, Ts_d=Ts;
+    // Ad(Ts)
     double Ad11,Ad12,Ad21,Ad22; expm2x2_double(Ts_d*A11,Ts_d*A12,Ts_d*A21,Ts_d*A22, Ad11,Ad12,Ad21,Ad22);
-    double RHS11 = (Ad11 - 1.0), RHS12 = Ad12;
-    double RHS21 = Ad21,        RHS22 = (Ad22 - 1.0);
+    // Y = (Ad - I)
+    double Y11 = Ad11 - 1.0, Y12 = Ad12, Y21 = Ad21, Y22 = Ad22 - 1.0;
+    // Solve A * F = Y for columns
     double F11,F21,F12,F22;
-    if (!solve2x2_double(A11,A12,A21,A22, RHS11,RHS21, F11,F21)) { F11 = Ts_d; F21 = 0.0; }
-    if (!solve2x2_double(A11,A12,A21,A22, RHS12,RHS22, F12,F22)) { F12 = 0.0; F22 = Ts_d; }
-    // dF via Frechet of phi1: F = Ts * phi1(A Ts) => dF = Ts * L_phi1(Z)[Ts dA]
-    double dphi11,dphi12,dphi21,dphi22;
-    frechet_phi1_2x2_double(A11,A12,A21,A22, dA11,dA12,dA21,dA22, Ts_d, dphi11,dphi12,dphi21,dphi22);
-    double dF11 = Ts_d * dphi11;
-    double dF12 = Ts_d * dphi12;
-    double dF21 = Ts_d * dphi21;
-    double dF22 = Ts_d * dphi22;
+    if (!solve2x2_double(A11,A12,A21,A22, Y11,Y21, F11,F21)) { F11 = Ts_d; F21 = 0.0; }
+    if (!solve2x2_double(A11,A12,A21,A22, Y12,Y22, F12,F22)) { F12 = 0.0; F22 = Ts_d; }
+    // dAd via double Frechet or FD
+    double dAd11,dAd12,dAd21,dAd22;
+    bool use_fd_ad = false;
+    if (const char* t = std::getenv("SSL_AD_USE_FD")) { use_fd_ad = (t[0]=='1'||t[0]=='t'||t[0]=='T'||t[0]=='y'||t[0]=='Y'); }
+    if (!use_fd_ad) {
+      frechet_expm_2x2_double(A11,A12,A21,A22, (double)dA11,(double)dA12,(double)dA21,(double)dA22, Ts_d,
+                              dAd11,dAd12,dAd21,dAd22);
+    } else {
+      double eps = 1e-6;
+      double Ap11=A11+eps*dA11, Ap12=A12+eps*dA12, Ap21=A21+eps*dA21, Ap22=A22+eps*dA22;
+      double Am11=A11-eps*dA11, Am12=A12-eps*dA12, Am21=A21-eps*dA21, Am22=A22-eps*dA22;
+      double Ep11,Ep12,Ep21,Ep22, Em11,Em12,Em21,Em22;
+      expm2x2_double(Ts_d*Ap11,Ts_d*Ap12,Ts_d*Ap21,Ts_d*Ap22, Ep11,Ep12,Ep21,Ep22);
+      expm2x2_double(Ts_d*Am11,Ts_d*Am12,Ts_d*Am21,Ts_d*Am22, Em11,Em12,Em21,Em22);
+      dAd11=(Ep11-Em11)/(2*eps); dAd12=(Ep12-Em12)/(2*eps);
+      dAd21=(Ep21-Em21)/(2*eps); dAd22=(Ep22-Em22)/(2*eps);
+    }
+    // R = dAd - dA F
+    double dAF11 = dA11*F11 + dA12*F21;
+    double dAF12 = dA11*F12 + dA12*F22;
+    double dAF21 = dA21*F11 + dA22*F21;
+    double dAF22 = dA21*F12 + dA22*F22;
+    double R11 = dAd11 - dAF11;
+    double R12 = dAd12 - dAF12;
+    double R21 = dAd21 - dAF21;
+    double R22 = dAd22 - dAF22;
+    // Solve A * dF = R for columns
+    double dF11,dF21,dF12,dF22;
+    if (!solve2x2_double(A11,A12,A21,A22, R11,R21, dF11,dF21)) { dF11=0.0; dF21=0.0; }
+    if (!solve2x2_double(A11,A12,A21,A22, R12,R22, dF12,dF22)) { dF12=0.0; dF22=0.0; }
     // dBd = dF * B + F * dB
-    const double dB1 = (double)dB1_f, dB2 = (double)dB2_f;
-    const double dFB1 = dF11*b1_d + dF12*b2_d;
-    const double dFB2 = dF21*b1_d + dF22*b2_d;
-    const double FdB1 = F11*dB1 + F12*dB2;
-    const double FdB2 = F21*dB1 + F22*dB2;
+    double dFB1 = dF11*b1 + dF12*b2;
+    double dFB2 = dF21*b1 + dF22*b2;
+    double FdB1 = F11*dB1 + F12*dB2;
+    double FdB2 = F21*dB1 + F22*dB2;
     oBd1 = (float)(dFB1 + FdB1);
     oBd2 = (float)(dFB2 + FdB2);
   };
@@ -940,8 +858,8 @@ inline void analytic_dAB_drates(
     float dAd11,dAd12,dAd21,dAd22;
     dAd_via_frechet(dA11,dA12,dA21,dA22, dAd11,dAd12,dAd21,dAd22);
     float dBd1,dBd2;
-    // Use robust block-expm Frechet for dBd (derivative of Phi1)
-    dBd_via_block(dA11,dA12,dA21,dA22, dB1,dB2, dBd1,dBd2);
+    // Use the verified ZOH-consistent linear-solve formulation for dBd (phi)
+    dBd_via_phi(dA11,dA12,dA21,dA22, dB1,dB2, dBd1,dBd2);
     out = {dAd11, dAd12, dAd21, dAd22, dBd1, dBd2};
   };
 
@@ -955,31 +873,7 @@ inline void analytic_dAB_drates(
   deriv_for(0.f, 0.f, 0.f, -1.f, 0.f, 0.f, d_q3);
 }
 
-/*
-Backward (hard gate only, fixed mask)
-- Inputs: grad_y (B,T) and the same parameters as forward.
-- Pipeline per batch item b:
-  1) Replay the forward deterministically to capture x_t, y_prev, a_t, and the per-step
-     branch mask (attack/release). Precompute AB_attack/AB_release.
-  2) Precompute d(Ad,Bd)/dR for attack and release branches. Numeric or analytic backends can
-     be toggled for debugging; by default we use numeric for robustness in production.
-  3) Reverse scan to accumulate operator adjoint contractions per step:
-     - Seed λ_{t+1} from grad_y[t] (because y_t = [1 1] x_{t+1}).
-     - Accumulate per-step contributions to dL/dR using the current λ and the per-rate
-       Jacobians. Split the contribution into Ad, Bd, and Gamma (feedback path) parts for debug.
-     - Accumulate parameter gradients for slope, threshold, x_peak_dB, and feedback.
-     - Propagate λ backwards using the effective A that absorbs the feedback path.
-  4) Chain dL/dR → dL/dT with R=1/T: gT_i += - dL/dR_i / T_i^2.
-  5) Optional saltation: at gate flips, compute J = λ · d x_{t+1}/dα using a split-step rule and
-     dα/d ln T from local delta sensitivities; add to gT_* with 1/T scaling.
-
-Notes:
-- Structural exclusion: on release steps, Raf/Ras do not affect dynamics; their contributions
-  are excluded from dL/dR accumulation.
-- No empirical scaling: gradients are in dB domain and chained exactly.
-- Debug: one-hot per-step check (SSL_DEBUG_ONEHOT_T) prints the Ad/Bd/Gamma dot-products and a
-  per-step FD reference using L_step = y_t for a chosen t.
-*/
+// Backward API (hard gate). Computes grads w.r.t x_peak_dB, T_* (via rates), comp_slope, comp_thresh, feedback.
 std::vector<torch::Tensor> ssl_smoother_backward(
     const torch::Tensor& grad_y_in,           // (B,T)
     const torch::Tensor& x_peak_dB_in,        // (B,T)
@@ -1050,39 +944,6 @@ std::vector<torch::Tensor> ssl_smoother_backward(
     DiscreteAB AB_attack = zoh_discretize_from_rates(Raf, Ras, Rsf, Rss, Ts);
     DiscreteAB AB_release = zoh_discretize_from_rates(0.f, 0.f, Rsf, Rss, Ts);
 
-    // Precompute per-branch Jacobians d(Ad,Bd)/dR (attack and release), mixing analytic/numeric per env
-    auto env_truthy = [](const char* v){ return v && (v[0]=='1'||v[0]=='t'||v[0]=='T'||v[0]=='y'||v[0]=='Y'); };
-    bool use_analytic_ad = false, use_analytic_bd = false;
-    if (const char* aj = std::getenv("SSL_USE_ANALYTIC_JAC")) { if (env_truthy(aj)) { use_analytic_ad = true; use_analytic_bd = true; } }
-    if (const char* aj_ad = std::getenv("SSL_USE_ANALYTIC_JAC_AD")) use_analytic_ad = env_truthy(aj_ad);
-    if (const char* aj_bd = std::getenv("SSL_USE_ANALYTIC_JAC_BD")) use_analytic_bd = env_truthy(aj_bd);
-    auto mix_fields = [&](const DiscreteAB& ana, const DiscreteAB& num){
-      DiscreteAB m{};
-      m.Ad11 = use_analytic_ad ? ana.Ad11 : num.Ad11;
-      m.Ad12 = use_analytic_ad ? ana.Ad12 : num.Ad12;
-      m.Ad21 = use_analytic_ad ? ana.Ad21 : num.Ad21;
-      m.Ad22 = use_analytic_ad ? ana.Ad22 : num.Ad22;
-      m.Bd1  = use_analytic_bd ? ana.Bd1  : num.Bd1;
-      m.Bd2  = use_analytic_bd ? ana.Bd2  : num.Bd2;
-      return m;
-    };
-    DiscreteAB att_q0_an, att_q1_an, att_q2_an, att_q3_an;
-    DiscreteAB att_q0_num, att_q1_num, att_q2_num, att_q3_num;
-    DiscreteAB rel_q0_an, rel_q1_an, rel_q2_an, rel_q3_an;
-    DiscreteAB rel_q0_num, rel_q1_num, rel_q2_num, rel_q3_num;
-    analytic_dAB_drates(Raf, Ras, Rsf, Rss, Ts, att_q0_an, att_q1_an, att_q2_an, att_q3_an);
-    numeric_dAB_drates(Raf, Ras, Rsf, Rss, Ts, att_q0_num, att_q1_num, att_q2_num, att_q3_num);
-    analytic_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, rel_q0_an, rel_q1_an, rel_q2_an, rel_q3_an);
-    numeric_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, rel_q0_num, rel_q1_num, rel_q2_num, rel_q3_num);
-    DiscreteAB d_att_q0_pre = mix_fields(att_q0_an, att_q0_num);
-    DiscreteAB d_att_q1_pre = mix_fields(att_q1_an, att_q1_num);
-    DiscreteAB d_att_q2_pre = mix_fields(att_q2_an, att_q2_num);
-    DiscreteAB d_att_q3_pre = mix_fields(att_q3_an, att_q3_num);
-    DiscreteAB d_rel_q0_pre = mix_fields(rel_q0_an, rel_q0_num);
-    DiscreteAB d_rel_q1_pre = mix_fields(rel_q1_an, rel_q1_num);
-    DiscreteAB d_rel_q2_pre = mix_fields(rel_q2_an, rel_q2_num);
-    DiscreteAB d_rel_q3_pre = mix_fields(rel_q3_an, rel_q3_num);
-
     if (b == 0) {
       if (const char* dbgA = std::getenv("SSL_DEBUG_AD_RAW")) {
         bool onA = (dbgA[0]=='1'||dbgA[0]=='t'||dbgA[0]=='T'||dbgA[0]=='y'||dbgA[0]=='Y');
@@ -1148,20 +1009,38 @@ std::vector<torch::Tensor> ssl_smoother_backward(
             float rhs2 = (Ad22 - 1.0f);
             if (!solve2x2(a11,a12,a21,a22, rhs1,rhs2, F12,F22)) { F12 = 0.0f; F22 = Ts; }
           }
+          // Bd via phi and exact (from zoh)
           const float Bd_phi_1 = F11*b1 + F12*b2;
           const float Bd_phi_2 = F21*b1 + F22*b2;
           std::printf("[ssl_bd_raw] ATT Bd phi vs exact: (%.9g, %.9g) vs (%.9g, %.9g)\n",
                       Bd_phi_1, Bd_phi_2, AB_attack.Bd1, AB_attack.Bd2);
 
-          // Compare directional dBd per-rate via analytic (block-expm) vs FD on Bd
-          auto dBd_block = [&](float dA11,float dA12,float dA21,float dA22,
-                               float dB1,float dB2, float& o1, float& o2){
-            float oBd1,oBd2;
-            // Reuse robust path implemented below via analytic_dAB_drates then pick Bd only
-            DiscreteAB dir; analytic_dAB_drates(Raf, Ras, Rsf, Rss, Ts, dir, dir, dir, dir);
-            // Above call fills with q0..q3 in sequence; instead, build a single directional using custom
-            // fallback: use numeric for Bd since this is debug; consistency check remains meaningful
-            o1 = 0.f; o2 = 0.f; // will be overwritten by FD routine
+          // Directional dBd per-rate via phi vs FD on Bd
+          auto dBd_phi = [&](float dA11,float dA12,float dA21,float dA22,
+                              float dB1,float dB2, float& o1, float& o2){
+            // dAd via Frechet at Ts
+            float dAd11,dAd12,dAd21,dAd22;
+            frechet_expm_2x2(a11, a12, a21, a22, dA11, dA12, dA21, dA22, Ts,
+                              dAd11, dAd12, dAd21, dAd22);
+            // dA*F
+            const float dAF11 = dA11*F11 + dA12*F21;
+            const float dAF12 = dA11*F12 + dA12*F22;
+            const float dAF21 = dA21*F11 + dA22*F21;
+            const float dAF22 = dA21*F12 + dA22*F22;
+            const float R11 = dAd11 - dAF11;
+            const float R12 = dAd12 - dAF12;
+            const float R21 = dAd21 - dAF21;
+            const float R22 = dAd22 - dAF22;
+            float dF11, dF21, dF12, dF22;
+            if (!solve2x2(a11,a12,a21,a22, R11,R21, dF11,dF21)) { dF11=0.f; dF21=0.f; }
+            if (!solve2x2(a11,a12,a21,a22, R12,R22, dF12,dF22)) { dF12=0.f; dF22=0.f; }
+            // dBd = dF*B + F*dB
+            const float dFB1 = dF11*b1 + dF12*b2;
+            const float dFB2 = dF21*b1 + dF22*b2;
+            const float FdB1 = F11*dB1 + F12*dB2;
+            const float FdB2 = F21*dB1 + F22*dB2;
+            o1 = dFB1 + FdB1;
+            o2 = dFB2 + FdB2;
           };
           auto Bd_from_rates = [&](float Raf_v,float Ras_v,float Rsf_v,float Rss_v, float& o1,float& o2){
             DiscreteAB ABv = zoh_discretize_from_rates(Raf_v, Ras_v, Rsf_v, Rss_v, Ts);
@@ -1181,32 +1060,19 @@ std::vector<torch::Tensor> ssl_smoother_backward(
           };
           auto print_d = [&](const char* name, float dA11,float dA12,float dA21,float dA22,
                              float dB1,float dB2, int which){
+            float an1,an2; dBd_phi(dA11,dA12,dA21,dA22, dB1,dB2, an1,an2);
             auto fd = fd_rate(which, (which>=2)?1e-4f:1e-6f);
-            std::printf("[ssl_bd_raw] ATT dBd_%s (an? vs FD): (%.9g, %.9g) vs (%.9g, %.9g)\n",
-                        name, fd.first, fd.second, fd.first, fd.second);
+            std::printf("[ssl_bd_raw] ATT dBd_%s (phi vs FD): (%.9g, %.9g) vs (%.9g, %.9g)\n",
+                        name, an1, an2, fd.first, fd.second);
           };
+          // q0=R_af: dA11=-1, dA12=-1, dB=[1,0]
           print_d("Raf", -1.f,-1.f, 0.f,0.f, 1.f,0.f, 0);
+          // q1=R_as: dA21=-1, dA22=-1, dB=[0,1]
           print_d("Ras", 0.f,0.f, -1.f,-1.f, 0.f,1.f, 1);
+          // q2=R_sf: dA11=-1, dB=[0,0]
           print_d("Rsf", -1.f,0.f, 0.f,0.f, 0.f,0.f, 2);
+          // q3=R_ss: dA22=-1, dB=[0,0]
           print_d("Rss", 0.f,0.f, 0.f,-1.f, 0.f,0.f, 3);
-        }
-      }
-
-      // Additional RAF-only debug: compare ATT/REL Bd derivatives for Raf
-      if (const char* dbr = std::getenv("SSL_DEBUG_RAF")) {
-        bool onr = (dbr[0]=='1'||dbr[0]=='t'||dbr[0]=='T'||dbr[0]=='y'||dbr[0]=='Y');
-        if (onr) {
-          DiscreteAB an_att_q0, an_att_q1, an_att_q2, an_att_q3;
-          DiscreteAB an_rel_q0, an_rel_q1, an_rel_q2, an_rel_q3;
-          analytic_dAB_drates(Raf, Ras, Rsf, Rss, Ts, an_att_q0, an_att_q1, an_att_q2, an_att_q3);
-          analytic_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, an_rel_q0, an_rel_q1, an_rel_q2, an_rel_q3);
-          DiscreteAB nu_att_q0, nu_att_q1, nu_att_q2, nu_att_q3;
-          DiscreteAB nu_rel_q0, nu_rel_q1, nu_rel_q2, nu_rel_q3;
-          numeric_dAB_drates(Raf, Ras, Rsf, Rss, Ts, nu_att_q0, nu_att_q1, nu_att_q2, nu_att_q3);
-          numeric_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, nu_rel_q0, nu_rel_q1, nu_rel_q2, nu_rel_q3);
-          std::printf("[raf_dbg] ATT dBd_Raf an=(%.9g,%.9g) num=(%.9g,%.9g) | REL dBd_Raf an=(%.9g,%.9g) num=(%.9g,%.9g)\n",
-                      an_att_q0.Bd1, an_att_q0.Bd2, nu_att_q0.Bd1, nu_att_q0.Bd2,
-                      an_rel_q0.Bd1, an_rel_q0.Bd2, nu_rel_q0.Bd1, nu_rel_q0.Bd2);
         }
       }
     }
@@ -1252,16 +1118,11 @@ std::vector<torch::Tensor> ssl_smoother_backward(
       lam1_hist.resize(T); lam2_hist.resize(T);
       lam1_hist_post.resize(T); lam2_hist_post.resize(T);
     }
-    int dbg_onehot_t = -1;
-    if (const char* oh = std::getenv("SSL_DEBUG_ONEHOT_T")) { int v = std::atoi(oh); if (v >= 0 && v < (int)T) dbg_onehot_t = v; }
     // Accumulate dL/dAd and dL/dBd per branch
     float gAd_att_11=0.f, gAd_att_12=0.f, gAd_att_21=0.f, gAd_att_22=0.f;
     float gBd_att_1=0.f, gBd_att_2=0.f;
     float gAd_rel_11=0.f, gAd_rel_12=0.f, gAd_rel_21=0.f, gAd_rel_22=0.f;
     float gBd_rel_1=0.f, gBd_rel_2=0.f;
-    // Accumulators for analytic dL/dR per rate (total and per-term breakdown)
-    double dL_dR_af_acc=0.0, dL_dR_as_acc=0.0, dL_dR_sf_acc=0.0, dL_dR_ss_acc=0.0;
-    double af_Ad=0.0, af_Bd=0.0, af_G=0.0, as_Ad=0.0, as_Bd=0.0, as_G=0.0, sf_Ad=0.0, sf_Bd=0.0, sf_G=0.0, ss_Ad=0.0, ss_Bd=0.0, ss_G=0.0;
 
     for (int64_t t = T - 1; t >= 0; --t) {
       // Seed from y_t (y_t = [1 1] x_{t+1})
@@ -1278,160 +1139,36 @@ std::vector<torch::Tensor> ssl_smoother_backward(
       const float y_prev_t = y_prev_arr[t];
 
       // Operator adjoint contributions for this step: dL/dAd += lambda_{t+1} * x_t^T, dL/dBd += lambda_{t+1} * a_t
-      // Effective input contribution to Bd includes feedback via A_eff term: a_eff = a - (slope*fb*m)*y_prev_t
-      const float m_t = is_attack ? 1.f : 0.f;
-      const float a_eff = a - (slope * fb * m_t) * y_prev_t;
-      // Also accumulate per-step dL/dR using dA_eff and dBd with current lambda (all in dB domain)
-      const double gamma_eff = (double)slope * (double)fb * (double)m_t;
-      auto contr_rate = [&](const DiscreteAB& d, double& accAd, double& accBd, double& accG)->double{
-        const double dA11 = (double)d.Ad11, dA12=(double)d.Ad12, dA21=(double)d.Ad21, dA22=(double)d.Ad22;
-        const double dB1  = (double)d.Bd1,  dB2 =(double)d.Bd2;
-        const double xsum = (double)x1_t + (double)x2_t;
-        // Components
-        const double vAd1 = dA11 * (double)x1_t + dA12 * (double)x2_t;
-        const double vAd2 = dA21 * (double)x1_t + dA22 * (double)x2_t;
-        const double vBd1 = dB1  * (double)a;
-        const double vBd2 = dB2  * (double)a;
-        const double vG1  = -(gamma_eff) * dB1 * xsum;
-        const double vG2  = -(gamma_eff) * dB2 * xsum;
-        const double dotAd = (double)l1 * vAd1 + (double)l2 * vAd2;
-        const double dotBd = (double)l1 * vBd1 + (double)l2 * vBd2;
-        const double dotG  = (double)l1 * vG1  + (double)l2 * vG2;
-        accAd += dotAd; accBd += dotBd; accG += dotG;
-        return dotAd + dotBd + dotG;
-      };
-      if (is_attack) {
-        dL_dR_af_acc += contr_rate(d_att_q0_pre, af_Ad, af_Bd, af_G);
-        dL_dR_as_acc += contr_rate(d_att_q1_pre, as_Ad, as_Bd, as_G);
-        dL_dR_sf_acc += contr_rate(d_att_q2_pre, sf_Ad, sf_Bd, sf_G);
-        dL_dR_ss_acc += contr_rate(d_att_q3_pre, ss_Ad, ss_Bd, ss_G);
-      } else {
-        // Series rates (Raf, Ras) do not affect the release branch; exclude their contributions here.
-        dL_dR_sf_acc += contr_rate(d_rel_q2_pre, sf_Ad, sf_Bd, sf_G);
-        dL_dR_ss_acc += contr_rate(d_rel_q3_pre, ss_Ad, ss_Bd, ss_G);
-      }
-      // Per-step diagnostic: if SSL_DEBUG_ONEHOT_T==t (and b==0), print analytic Ad/Bd/Gamma contractions
-      // and a one-hot FD reference for L_step = y_t with fixed mask. This isolates the contribution of a
-      // single timestep and helps verify signs/transposes in the contraction.
-      if (b==0 && dbg_onehot_t == (int)t) {
-        auto print_parts = [&](const char* name, const DiscreteAB& d){
-          const double dA11 = (double)d.Ad11, dA12=(double)d.Ad12, dA21=(double)d.Ad21, dA22=(double)d.Ad22;
-          const double dB1  = (double)d.Bd1,  dB2 =(double)d.Bd2;
-          const double xsum = (double)x1_t + (double)x2_t;
-          const double vAd1 = dA11 * (double)x1_t + dA12 * (double)x2_t;
-          const double vAd2 = dA21 * (double)x1_t + dA22 * (double)x2_t;
-          const double vBd1 = dB1  * (double)a;
-          const double vBd2 = dB2  * (double)a;
-          const double vG1  = (gamma_eff) * dB1 * xsum;
-          const double vG2  = (gamma_eff) * dB2 * xsum;
-          const double dotAd = (double)l1 * vAd1 + (double)l2 * vAd2;
-          const double dotBd = (double)l1 * vBd1 + (double)l2 * vBd2;
-          const double dotG  = (double)l1 * vG1  + (double)l2 * vG2;
-          std::printf("[onehot] t=%lld %s dot(Ad)=%.9g dot(Bd)=%.9g dot(G)=%.9g total=%.9g\n",
-                      (long long)t, name, dotAd, dotBd, dotG, dotAd+dotBd+dotG);
-        };
-        // Print analytic decomposition
-        if (is_attack) {
-          print_parts("att_Raf", d_att_q0_pre);
-          print_parts("att_Ras", d_att_q1_pre);
-          print_parts("att_Rsf", d_att_q2_pre);
-          print_parts("att_Rss", d_att_q3_pre);
-        } else {
-          print_parts("rel_Raf", d_rel_q0_pre);
-          print_parts("rel_Ras", d_rel_q1_pre);
-          print_parts("rel_Rsf", d_rel_q2_pre);
-          print_parts("rel_Rss", d_rel_q3_pre);
-        }
-        // Per-step FD (fixed mask one-hot): L_step = y_t
-        auto y_step_for_rates = [&](double Raf_v,double Ras_v,double Rsf_v,double Rss_v)->double{
-          DiscreteAB ABa = zoh_discretize_from_rates((float)Raf_v,(float)Ras_v,(float)Rsf_v,(float)Rss_v, Ts);
-          DiscreteAB ABr = zoh_discretize_from_rates(0.f,0.f,(float)Rsf_v,(float)Rss_v, Ts);
-          double x1l=0.0,x2l=0.0; double yt=0.0;
-          for (int64_t tt=0; tt<=t; ++tt){
-            const bool ia = (at_mask[tt]!=0);
-            const DiscreteAB& ABt_loc = ia?ABa:ABr;
-            const double a_loc = (double)g_arr[tt];
-            const double nx1 = (double)ABt_loc.Ad11*x1l + (double)ABt_loc.Ad12*x2l + (double)ABt_loc.Bd1*a_loc;
-            const double nx2 = (double)ABt_loc.Ad21*x1l + (double)ABt_loc.Ad22*x2l + (double)ABt_loc.Bd2*a_loc;
-            x1l=nx1; x2l=nx2; yt = x1l + x2l;
-          }
-          return yt; // one-hot grad
-        };
-        auto onehot_fd = [&](int which)->double{
-          const double base[4]={Raf,Ras,Rsf,Rss};
-          double plus[4]={Raf,Ras,Rsf,Rss}, minus[4]={Raf,Ras,Rsf,Rss};
-          double q=base[which]; double eps=((which>=2)?1e-4:1e-6)*((fabs(q)>1.0)?fabs(q):1.0);
-          plus[which]+=eps; minus[which]-=eps;
-          double Lp=y_step_for_rates(plus[0],plus[1],plus[2],plus[3]);
-          double Lm=y_step_for_rates(minus[0],minus[1],minus[2],minus[3]);
-          return (Lp-Lm)/(2.0*eps);
-        };
-        std::printf("[onehot_fd] t=%lld dR (af %.9g, as %.9g, sf %.9g, ss %.9g)\n", (long long)t, onehot_fd(0), onehot_fd(1), onehot_fd(2), onehot_fd(3));
-      }
-      // Optional step-level debug for first few steps in batch 0
-      if (b == 0 && t < 4) {
-        if (const char* dbg = std::getenv("SSL_DEBUG_STEP_CONTR")) {
-          bool on = (dbg[0]=='1'||dbg[0]=='t'||dbg[0]=='T'||dbg[0]=='y'||dbg[0]=='Y');
-          if (on) {
-            auto print_rate = [&](const char* name, const DiscreteAB& d){
-              double dA11e = (double)d.Ad11 - (double)gamma_eff * (double)d.Bd1;
-              double dA12e = (double)d.Ad12 - (double)gamma_eff * (double)d.Bd1;
-              double dA21e = (double)d.Ad21 - (double)gamma_eff * (double)d.Bd2;
-              double dA22e = (double)d.Ad22 - (double)gamma_eff * (double)d.Bd2;
-              double v1 = dA11e * (double)x1_t + dA12e * (double)x2_t + (double)d.Bd1 * (double)a;
-              double v2 = dA21e * (double)x1_t + dA22e * (double)x2_t + (double)d.Bd2 * (double)a;
-              double dot = (double)l1 * v1 + (double)l2 * v2;
-              std::printf("[step_contr] t=%lld %s lam=(%.6g,%.6g) x=(%.6g,%.6g) a=%.6g m=%.6g gamma=%.6g | v=(%.6g,%.6g) dot=%.6g\n",
-                          (long long)t, name, (double)l1,(double)l2, (double)x1_t,(double)x2_t, (double)a, (double)m_t, (double)gamma_eff,
-                          v1, v2, dot);
-            };
-            if (is_attack) {
-              print_rate("att_Raf", d_att_q0_pre);
-              print_rate("att_Ras", d_att_q1_pre);
-              print_rate("att_Rsf", d_att_q2_pre);
-              print_rate("att_Rss", d_att_q3_pre);
-            } else {
-              print_rate("rel_Raf", d_rel_q0_pre);
-              print_rate("rel_Ras", d_rel_q1_pre);
-              print_rate("rel_Rsf", d_rel_q2_pre);
-              print_rate("rel_Rss", d_rel_q3_pre);
-            }
-          }
-        }
-      }
       if (is_attack) {
         gAd_att_11 += l1 * x1_t; gAd_att_12 += l1 * x2_t;
         gAd_att_21 += l2 * x1_t; gAd_att_22 += l2 * x2_t;
-        gBd_att_1  += l1 * a_eff;    gBd_att_2  += l2 * a_eff;
+        gBd_att_1  += l1 * a;    gBd_att_2  += l2 * a;
       } else {
         gAd_rel_11 += l1 * x1_t; gAd_rel_12 += l1 * x2_t;
         gAd_rel_21 += l2 * x1_t; gAd_rel_22 += l2 * x2_t;
-        gBd_rel_1  += l1 * a_eff;    gBd_rel_2  += l2 * a_eff;
+        gBd_rel_1  += l1 * a;    gBd_rel_2  += l2 * a;
       }
 
       // dL/dg = (Bd^T) * lambda
       const float dL_dg = AB.Bd1 * l1 + AB.Bd2 * l2;
 
       // Static curve chain (hard clamp mask m = [a < 0])
-      const float m = is_attack ? 1.f : 0.f;
+      const float m = (a < 0.f) ? 1.f : 0.f;
       const float gamma = dL_dg * m;
 
-      // Grads for slope, thresh, x_peak_dB, fb
+      // Grads for slope, thresh, x_peak_dB, fb and feedback into y_{t-1}
       // a = slope * (thresh - (x_peak_dB + fb * y_{t-1}))
       g_slope.data_ptr<float>()[b] += gamma * (thresh - (x_peak_dB.data_ptr<float>()[b*T + t] + fb * y_prev_t));
       g_thresh.data_ptr<float>()[b] += gamma * slope;
       gx_ptr[t] += gamma * (-slope);
       g_fb.data_ptr<float>()[b] += gamma * (-slope) * y_prev_t;
+      float add_y_prev_scalar = gamma * (-slope) * fb; // to y_{t-1}
 
       // No surrogate gate path; fixed-mask only
 
-      // Propagate adjoint to previous state using A_eff^T (absorbs feedback-y_prev path)
-      const float A11e = AB.Ad11 - (slope * fb * m) * AB.Bd1;
-      const float A12e = AB.Ad12 - (slope * fb * m) * AB.Bd1;
-      const float A21e = AB.Ad21 - (slope * fb * m) * AB.Bd2;
-      const float A22e = AB.Ad22 - (slope * fb * m) * AB.Bd2;
-      const float nl1 = A11e * l1 + A21e * l2;
-      const float nl2 = A12e * l1 + A22e * l2;
+      // Propagate adjoint to previous state: lambda_t = Ad^T * lambda_{t+1} + [1,1]*add_y_prev_scalar
+      const float nl1 = AB.Ad11 * l1 + AB.Ad21 * l2 + add_y_prev_scalar;
+      const float nl2 = AB.Ad12 * l1 + AB.Ad22 * l2 + add_y_prev_scalar;
       l1 = nl1; l2 = nl2;
       if (step_dbg || salt_on) { lam1_hist_post[t] = l1; lam2_hist_post[t] = l2; }
     }
@@ -1448,72 +1185,281 @@ std::vector<torch::Tensor> ssl_smoother_backward(
     }
 
     if (!use_fd) {
-      // Use accumulated per-step contractions directly in dB domain
-      const double dL_dR_af = dL_dR_af_acc;
-      const double dL_dR_as = dL_dR_as_acc;
-      const double dL_dR_sf = dL_dR_sf_acc;
-      const double dL_dR_ss = dL_dR_ss_acc;
-
-      // Debug compare analytic dL/dR with FD on rates using fixed mask and grad_y contraction
-      auto truthy = [&](const char* v){ return v && (v[0]=='1'||v[0]=='t'||v[0]=='T'||v[0]=='y'||v[0]=='Y'); };
-      if (const char* dbg = std::getenv("SSL_DEBUG_SENS")) if (truthy(dbg)) {
-        std::printf("[accum_dbg] dL/dR parts (Ad,Bd,Gamma): af (%.9g, %.9g, %.9g) as (%.9g, %.9g, %.9g) sf (%.9g, %.9g, %.9g) ss (%.9g, %.9g, %.9g)\n",
-                    af_Ad, af_Bd, af_G, as_Ad, as_Bd, as_G, sf_Ad, sf_Bd, sf_G, ss_Ad, ss_Bd, ss_G);
-        auto scalar_loss_fixed = [&](float Raf_v, float Ras_v, float Rsf_v, float Rss_v) -> double {
-          DiscreteAB ABa = zoh_discretize_from_rates(Raf_v, Ras_v, Rsf_v, Rss_v, Ts);
-          DiscreteAB ABr = zoh_discretize_from_rates(0.f, 0.f, Rsf_v, Rss_v, Ts);
-          double x1l=0.0, x2l=0.0, yprevl=0.0, L=0.0;
-          for (int64_t t = 0; t < T; ++t) {
-            const bool is_att = (at_mask[t] != 0);
-            const DiscreteAB& ABf = is_att ? ABa : ABr;
-            // Recompute a under perturbed rates via yprevl (fixed mask only)
-            double a = (double)slope * ((double)thresh - ((double)x_ptr[t] + (double)fb * yprevl));
-            if (a > 0.0) a = 0.0;
-            const double nx1 = (double)ABf.Ad11 * x1l + (double)ABf.Ad12 * x2l + (double)ABf.Bd1 * a;
-            const double nx2 = (double)ABf.Ad21 * x1l + (double)ABf.Ad22 * x2l + (double)ABf.Bd2 * a;
-            x1l = nx1; x2l = nx2;
-            const double y_t = x1l + x2l;
-            L += (double)gy_ptr[t] * y_t;
-            yprevl = y_t;
-          }
-          return L;
-        };
-        auto fd_dR = [&](int which)->double{
-          const double base[4] = {Raf, Ras, Rsf, Rss};
-          double plus[4] = {Raf, Ras, Rsf, Rss};
-          double minus[4]= {Raf, Ras, Rsf, Rss};
-          double q = base[which];
-          double scale = (which>=2) ? 1e-4 : 1e-6;
-          double epsr = scale * ((std::fabs(q) > 1.0) ? std::fabs(q) : 1.0);
-          plus[which] = base[which] + epsr;
-          minus[which]= base[which] - epsr;
-          double Lp = scalar_loss_fixed((float)plus[0],(float)plus[1],(float)plus[2],(float)plus[3]);
-          double Lm = scalar_loss_fixed((float)minus[0],(float)minus[1],(float)minus[2],(float)minus[3]);
-          return (Lp - Lm) / (2.0 * epsr);
-        };
-        double fdR_af = fd_dR(0), fdR_as = fd_dR(1), fdR_sf = fd_dR(2), fdR_ss = fd_dR(3);
-        std::printf("[sens_dbg] dL/dR forward: af %.9g as %.9g sf %.9g ss %.9g | FD: af %.9g as %.9g sf %.9g ss %.9g\n",
-                    (double)dL_dR_af, (double)dL_dR_as, (double)dL_dR_sf, (double)dL_dR_ss,
-                    fdR_af, fdR_as, fdR_sf, fdR_ss);
+      // Analytic vs numeric operator Jacobians with split toggles for Ad and Bd
+      // Flags precedence: SSL_USE_ANALYTIC_JAC (master) -> SSL_USE_ANALYTIC_JAC_AD / _BD (override if set)
+      auto env_truthy = [](const char* v){ return v && (v[0]=='1'||v[0]=='t'||v[0]=='T'||v[0]=='y'||v[0]=='Y'); };
+      bool use_analytic_ad = false, use_analytic_bd = false;
+      if (const char* aj = std::getenv("SSL_USE_ANALYTIC_JAC")) {
+        if (env_truthy(aj)) { use_analytic_ad = true; use_analytic_bd = true; }
+      }
+      if (const char* aj_ad = std::getenv("SSL_USE_ANALYTIC_JAC_AD")) {
+        use_analytic_ad = env_truthy(aj_ad);
+      }
+      if (const char* aj_bd = std::getenv("SSL_USE_ANALYTIC_JAC_BD")) {
+        use_analytic_bd = env_truthy(aj_bd);
       }
 
-      // Chain dL/dR -> dL/dT where R = 1/T
-      gT_af.data_ptr<float>()[b] += - dL_dR_af / (Taf * Taf);
-      gT_as.data_ptr<float>()[b] += - dL_dR_as / (Tas * Tas);
-      gT_sf.data_ptr<float>()[b] += - dL_dR_sf / (Tsf * Tsf);
-      gT_ss.data_ptr<float>()[b] += - dL_dR_ss / (Tss * Tss);
+      auto mix_fields = [&](const DiscreteAB& ana, const DiscreteAB& num){
+        DiscreteAB m{};
+        // Select Ad
+        m.Ad11 = use_analytic_ad ? ana.Ad11 : num.Ad11;
+        m.Ad12 = use_analytic_ad ? ana.Ad12 : num.Ad12;
+        m.Ad21 = use_analytic_ad ? ana.Ad21 : num.Ad21;
+        m.Ad22 = use_analytic_ad ? ana.Ad22 : num.Ad22;
+        // Select Bd
+        m.Bd1  = use_analytic_bd ? ana.Bd1  : num.Bd1;
+        m.Bd2  = use_analytic_bd ? ana.Bd2  : num.Bd2;
+        return m;
+      };
 
-      /*
-      Saltation (optional, hard gate):
-      - Detect flips at indices t where the hard mask changes (attack↔release).
-      - Locate within-sample flip α by linear interpolation of δ = a - y_prev over [t-1, t].
-      - Compute J = λ_t · (d x_{t+1}/dα) by composing two ZOH steps split at τ = α Ts.
-      - Compute dα/d ln T using local delta sensitivities g_dlnT_* previously computed by
-        central differences of the delta sequence; closed-form derivative of α avoids per-flip replays:
-          α = -δ_{t-1} / (δ_t - δ_{t-1}) ⇒ dα = (δ_{t-1} dδ_t - δ_t dδ_{t-1}) / (δ_t - δ_{t-1})^2.
-      - Add contributions to gT_* as (dL/dα) · (dα/d ln T) · (1/T_*).
-      Complexity: O(#flips). Cap via SSL_SALTATION_MAX_FLIPS; logs are throttled.
-      */
+      // Derivatives of (Ad,Bd) w.r.t rates for attack branch
+      DiscreteAB d_att_q0, d_att_q1, d_att_q2, d_att_q3; // q0=R_af, q1=R_as, q2=R_sf, q3=R_ss
+      if (use_analytic_ad || use_analytic_bd) {
+        // Compute both numeric and analytic, then mix
+        DiscreteAB an_att_q0, an_att_q1, an_att_q2, an_att_q3;
+        DiscreteAB nu_att_q0, nu_att_q1, nu_att_q2, nu_att_q3;
+        analytic_dAB_drates(Raf, Ras, Rsf, Rss, Ts, an_att_q0, an_att_q1, an_att_q2, an_att_q3);
+        numeric_dAB_drates(Raf, Ras, Rsf, Rss, Ts, nu_att_q0, nu_att_q1, nu_att_q2, nu_att_q3);
+        d_att_q0 = mix_fields(an_att_q0, nu_att_q0);
+        d_att_q1 = mix_fields(an_att_q1, nu_att_q1);
+        d_att_q2 = mix_fields(an_att_q2, nu_att_q2);
+        d_att_q3 = mix_fields(an_att_q3, nu_att_q3);
+      } else {
+        numeric_dAB_drates(Raf, Ras, Rsf, Rss, Ts, d_att_q0, d_att_q1, d_att_q2, d_att_q3);
+      }
+      // Derivatives for release branch (series rates = 0)
+      DiscreteAB d_rel_q0, d_rel_q1, d_rel_q2, d_rel_q3;
+      if (use_analytic_ad || use_analytic_bd) {
+        DiscreteAB an_rel_q0, an_rel_q1, an_rel_q2, an_rel_q3;
+        DiscreteAB nu_rel_q0, nu_rel_q1, nu_rel_q2, nu_rel_q3;
+        analytic_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, an_rel_q0, an_rel_q1, an_rel_q2, an_rel_q3);
+        numeric_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, nu_rel_q0, nu_rel_q1, nu_rel_q2, nu_rel_q3);
+        d_rel_q0 = mix_fields(an_rel_q0, nu_rel_q0);
+        d_rel_q1 = mix_fields(an_rel_q1, nu_rel_q1);
+        d_rel_q2 = mix_fields(an_rel_q2, nu_rel_q2);
+        d_rel_q3 = mix_fields(an_rel_q3, nu_rel_q3);
+      } else {
+        numeric_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, d_rel_q0, d_rel_q1, d_rel_q2, d_rel_q3);
+      }
+
+      auto dotAB = [](const DiscreteAB& d, float gAd11, float gAd12, float gAd21, float gAd22, float gBd1, float gBd2) -> float {
+        float s = 0.f;
+        s += gAd11 * d.Ad11 + gAd12 * d.Ad12 + gAd21 * d.Ad21 + gAd22 * d.Ad22;
+        s += gBd1  * d.Bd1  + gBd2  * d.Bd2;
+        return s;
+      };
+
+      float dL_dR_af = dotAB(d_att_q0, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+      float dL_dR_as = dotAB(d_att_q1, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+      float dL_dR_sf = dotAB(d_att_q2, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                           + dotAB(d_rel_q2, gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+      float dL_dR_ss = dotAB(d_att_q3, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                           + dotAB(d_rel_q3, gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+      if (use_analytic_ad || use_analytic_bd) {
+        if (const char* dbg = std::getenv("SSL_DEBUG_ANALYTIC_JAC")) {
+          bool on = (dbg[0] == '1' || dbg[0] == 't' || dbg[0] == 'T' || dbg[0] == 'y' || dbg[0] == 'Y');
+          if (on) {
+            DiscreteAB n_att_q0, n_att_q1, n_att_q2, n_att_q3;
+            DiscreteAB n_rel_q0, n_rel_q1, n_rel_q2, n_rel_q3;
+            numeric_dAB_drates(Raf, Ras, Rsf, Rss, Ts, n_att_q0, n_att_q1, n_att_q2, n_att_q3);
+            numeric_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, n_rel_q0, n_rel_q1, n_rel_q2, n_rel_q3);
+            auto diff = [](const DiscreteAB& a, const DiscreteAB& b){
+              return std::max({std::fabs(a.Ad11-b.Ad11), std::fabs(a.Ad12-b.Ad12), std::fabs(a.Ad21-b.Ad21), std::fabs(a.Ad22-b.Ad22), std::fabs(a.Bd1-b.Bd1), std::fabs(a.Bd2-b.Bd2)});
+            };
+            std::printf("[ssl_smoother_dbg] analytic vs numeric d(Ad,Bd)/dR deltas: af %.3g as %.3g sf %.3g ss %.3g\n",
+                        diff(d_att_q0,n_att_q0), diff(d_att_q1,n_att_q1), diff(d_att_q2,n_att_q2), diff(d_att_q3,n_att_q3));
+            // Also compare resulting dL/dR values (analytic operator Jacobians vs numeric operator Jacobians)
+            auto dotAB = [](const DiscreteAB& d, float gAd11, float gAd12, float gAd21, float gAd22, float gBd1, float gBd2) -> float {
+              float s = 0.f;
+              s += gAd11 * d.Ad11 + gAd12 * d.Ad12 + gAd21 * d.Ad21 + gAd22 * d.Ad22;
+              s += gBd1  * d.Bd1  + gBd2  * d.Bd2;
+              return s;
+            };
+            // Recompute analytic d(Ad,Bd)/dR explicitly for comparison
+            DiscreteAB a_att_q0, a_att_q1, a_att_q2, a_att_q3;
+            DiscreteAB a_rel_q0, a_rel_q1, a_rel_q2, a_rel_q3;
+            analytic_dAB_drates(Raf, Ras, Rsf, Rss, Ts, a_att_q0, a_att_q1, a_att_q2, a_att_q3);
+            analytic_dAB_drates(0.f, 0.f, Rsf, Rss, Ts, a_rel_q0, a_rel_q1, a_rel_q2, a_rel_q3);
+            // Full contractions
+            float dL_dR_af_num = dotAB(n_att_q0, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dL_dR_as_num = dotAB(n_att_q1, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dL_dR_sf_num = dotAB(n_att_q2, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(n_rel_q2, gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dL_dR_ss_num = dotAB(n_att_q3, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(n_rel_q3, gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dL_dR_af_an  = dotAB(a_att_q0, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dL_dR_as_an  = dotAB(a_att_q1, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dL_dR_sf_an  = dotAB(a_att_q2, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(a_rel_q2, gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dL_dR_ss_an  = dotAB(a_att_q3, gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(a_rel_q3, gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            std::printf("[ssl_smoother_dbg] dL/dR (analytic vs numeric): af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                        dL_dR_af_an, dL_dR_af_num, dL_dR_as_an, dL_dR_as_num, dL_dR_sf_an, dL_dR_sf_num, dL_dR_ss_an, dL_dR_ss_num);
+            // Also compare contraction (numeric Jacobians) vs fixed-mask scalar FD in rate space
+            auto scalar_loss_fixed = [&](float Raf_v, float Ras_v, float Rsf_v, float Rss_v) -> float {
+              DiscreteAB ABa = zoh_discretize_from_rates(Raf_v, Ras_v, Rsf_v, Rss_v, Ts);
+              DiscreteAB ABr = zoh_discretize_from_rates(0.f, 0.f, Rsf_v, Rss_v, Ts);
+              float x1f=0.f, x2f=0.f, Lf=0.f;
+              for (int64_t tt = 0; tt < T; ++tt) {
+                const float a = g_arr[tt];
+                const bool is_att = (at_mask[tt] != 0);
+                const DiscreteAB& ABf = is_att ? ABa : ABr;
+                const float nx1f = ABf.Ad11 * x1f + ABf.Ad12 * x2f + ABf.Bd1 * a;
+                const float nx2f = ABf.Ad21 * x1f + ABf.Ad22 * x2f + ABf.Bd2 * a;
+                x1f = nx1f; x2f = nx2f;
+                const float yf = x1f + x2f;
+                Lf += gy_ptr[tt] * yf;
+              }
+              return Lf;
+            };
+            auto fd_rate = [&](float Raf_c, float Ras_c, float Rsf_c, float Rss_c, int which)->float{
+              const float base[4] = {Raf_c, Ras_c, Rsf_c, Rss_c};
+              float plus[4] = {Raf_c, Ras_c, Rsf_c, Rss_c};
+              float minus[4] = {Raf_c, Ras_c, Rsf_c, Rss_c};
+              const float q = base[which];
+              float scale = (which == 2 || which == 3) ? 1e-4f : 1e-6f;
+              float epsr = scale * ((std::fabs(q) > 1.f) ? std::fabs(q) : 1.f);
+              plus[which] = base[which] + epsr;
+              minus[which] = base[which] - epsr;
+              float Lp = scalar_loss_fixed(plus[0], plus[1], plus[2], plus[3]);
+              float Lm = scalar_loss_fixed(minus[0], minus[1], minus[2], minus[3]);
+              return (Lp - Lm) / (2.f * epsr);
+            };
+            float dR_af_fd = fd_rate(Raf, Ras, Rsf, Rss, 0);
+            float dR_as_fd = fd_rate(Raf, Ras, Rsf, Rss, 1);
+            float dR_sf_fd = fd_rate(Raf, Ras, Rsf, Rss, 2);
+            float dR_ss_fd = fd_rate(Raf, Ras, Rsf, Rss, 3);
+            std::printf("[ssl_smoother_dbg] dL/dR (numeric contraction vs FD): af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                        dL_dR_af_num, dR_af_fd, dL_dR_as_num, dR_as_fd, dL_dR_sf_num, dR_sf_fd, dL_dR_ss_num, dR_ss_fd);
+            // Breakdown Ad-only and Bd-only contributions
+            auto onlyAd = [](DiscreteAB d){ d.Bd1 = 0.f; d.Bd2 = 0.f; return d; };
+            auto onlyBd = [](DiscreteAB d){ d.Ad11 = d.Ad12 = d.Ad21 = d.Ad22 = 0.f; return d; };
+            float dR_af_num_Ad = dotAB(onlyAd(n_att_q0), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_af_an_Ad  = dotAB(onlyAd(a_att_q0), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_af_num_Bd = dotAB(onlyBd(n_att_q0), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_af_an_Bd  = dotAB(onlyBd(a_att_q0), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_as_num_Ad = dotAB(onlyAd(n_att_q1), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_as_an_Ad  = dotAB(onlyAd(a_att_q1), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_as_num_Bd = dotAB(onlyBd(n_att_q1), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_as_an_Bd  = dotAB(onlyBd(a_att_q1), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_sf_num_Ad = dotAB(onlyAd(n_att_q2), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyAd(n_rel_q2), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_sf_an_Ad  = dotAB(onlyAd(a_att_q2), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyAd(a_rel_q2), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_sf_num_Bd = dotAB(onlyBd(n_att_q2), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyBd(n_rel_q2), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_sf_an_Bd  = dotAB(onlyBd(a_att_q2), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyBd(a_rel_q2), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_ss_num_Ad = dotAB(onlyAd(n_att_q3), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyAd(n_rel_q3), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_ss_an_Ad  = dotAB(onlyAd(a_att_q3), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyAd(a_rel_q3), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_ss_num_Bd = dotAB(onlyBd(n_att_q3), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyBd(n_rel_q3), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_ss_an_Bd  = dotAB(onlyBd(a_att_q3), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2)
+                               + dotAB(onlyBd(a_rel_q3), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            std::printf("[ssl_smoother_dbg] Ad-only (an vs num):   af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                        dR_af_an_Ad, dR_af_num_Ad, dR_as_an_Ad, dR_as_num_Ad, dR_sf_an_Ad, dR_sf_num_Ad, dR_ss_an_Ad, dR_ss_num_Ad);
+            std::printf("[ssl_smoother_dbg] Bd-only (an vs num):   af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                        dR_af_an_Bd, dR_af_num_Bd, dR_as_an_Bd, dR_as_num_Bd, dR_sf_an_Bd, dR_sf_num_Bd, dR_ss_an_Bd, dR_ss_num_Bd);
+            // Attack-only vs Release-only Bd contributions per rate
+            float dR_af_num_Bd_att = dotAB(onlyBd(n_att_q0), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_af_an_Bd_att  = dotAB(onlyBd(a_att_q0), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_af_num_Bd_rel = dotAB(onlyBd(n_rel_q0), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_af_an_Bd_rel  = dotAB(onlyBd(a_rel_q0), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+
+            float dR_as_num_Bd_att = dotAB(onlyBd(n_att_q1), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_as_an_Bd_att  = dotAB(onlyBd(a_att_q1), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_as_num_Bd_rel = dotAB(onlyBd(n_rel_q1), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_as_an_Bd_rel  = dotAB(onlyBd(a_rel_q1), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+
+            float dR_sf_num_Bd_att = dotAB(onlyBd(n_att_q2), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_sf_an_Bd_att  = dotAB(onlyBd(a_att_q2), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_sf_num_Bd_rel = dotAB(onlyBd(n_rel_q2), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_sf_an_Bd_rel  = dotAB(onlyBd(a_rel_q2), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+
+            float dR_ss_num_Bd_att = dotAB(onlyBd(n_att_q3), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_ss_an_Bd_att  = dotAB(onlyBd(a_att_q3), gAd_att_11, gAd_att_12, gAd_att_21, gAd_att_22, gBd_att_1, gBd_att_2);
+            float dR_ss_num_Bd_rel = dotAB(onlyBd(n_rel_q3), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+            float dR_ss_an_Bd_rel  = dotAB(onlyBd(a_rel_q3), gAd_rel_11, gAd_rel_12, gAd_rel_21, gAd_rel_22, gBd_rel_1, gBd_rel_2);
+
+            std::printf("[ssl_smoother_dbg] Bd-only ATT (an vs num): af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                        dR_af_an_Bd_att, dR_af_num_Bd_att, dR_as_an_Bd_att, dR_as_num_Bd_att, dR_sf_an_Bd_att, dR_sf_num_Bd_att, dR_ss_an_Bd_att, dR_ss_num_Bd_att);
+            std::printf("[ssl_smoother_dbg] Bd-only REL (an vs num): af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                        dR_af_an_Bd_rel, dR_af_num_Bd_rel, dR_as_an_Bd_rel, dR_as_num_Bd_rel, dR_sf_an_Bd_rel, dR_sf_num_Bd_rel, dR_ss_an_Bd_rel, dR_ss_num_Bd_rel);
+
+            if (const char* sbd = std::getenv("SSL_DEBUG_STEP_BD")) {
+              bool sbd_on = (sbd[0]=='1'||sbd[0]=='t'||sbd[0]=='T'||sbd[0]=='y'||sbd[0]=='Y');
+              if (sbd_on) {
+                // Per-step Bd-only attack contributions, summed over steps, using analytic and numeric dBd
+                double w1_sum = 0.0, w2_sum = 0.0;
+                for (int64_t tt = 0; tt < T; ++tt) if (at_mask[tt]) {
+                  const double a_t = static_cast<double>(g_arr[tt]);
+                  const double l1_t = static_cast<double>(lam1_hist[tt]);
+                  const double l2_t = static_cast<double>(lam2_hist[tt]);
+                  w1_sum += l1_t * a_t;
+                  w2_sum += l2_t * a_t;
+                }
+                auto bd_only = [&](const DiscreteAB& d)->std::pair<double,double>{ return {static_cast<double>(d.Bd1), static_cast<double>(d.Bd2)}; };
+                auto dot_w = [&](std::pair<double,double> v)->double{ return v.first * w1_sum + v.second * w2_sum; };
+                // Attack branch only
+                double step_af_an = dot_w(bd_only(a_att_q0));
+                double step_as_an = dot_w(bd_only(a_att_q1));
+                double step_sf_an = dot_w(bd_only(a_att_q2));
+                double step_ss_an = dot_w(bd_only(a_att_q3));
+                double step_af_num = dot_w(bd_only(n_att_q0));
+                double step_as_num = dot_w(bd_only(n_att_q1));
+                double step_sf_num = dot_w(bd_only(n_att_q2));
+                double step_ss_num = dot_w(bd_only(n_att_q3));
+                std::printf("[ssl_smoother_dbg] Bd-only ATT step-sum (an vs num): af %.6g vs %.6g | as %.6g vs %.6g | sf %.6g vs %.6g | ss %.6g vs %.6g\n",
+                            step_af_an, step_af_num, step_as_an, step_as_num, step_sf_an, step_sf_num, step_ss_an, step_ss_num);
+
+                // Optional per-step trace of contributions for first up to 8 steps
+                if (const char* ptr = std::getenv("SSL_DEBUG_PHI_TRACE")) {
+                  bool trace_on = (ptr[0]=='1'||ptr[0]=='t'||ptr[0]=='T'||ptr[0]=='y'||ptr[0]=='Y');
+                  if (trace_on) {
+                    // Build attack-only Bd (analytic and numeric) vectors per rate
+                    auto bd_pair = [&](const DiscreteAB& d){ return std::array<double,2>{static_cast<double>(d.Bd1), static_cast<double>(d.Bd2)}; };
+                    auto A_bd_af_an = bd_pair(a_att_q0);
+                    auto A_bd_as_an = bd_pair(a_att_q1);
+                    auto A_bd_sf_an = bd_pair(a_att_q2);
+                    auto A_bd_ss_an = bd_pair(a_att_q3);
+                    auto N_bd_af = bd_pair(n_att_q0);
+                    auto N_bd_as = bd_pair(n_att_q1);
+                    auto N_bd_sf = bd_pair(n_att_q2);
+                    auto N_bd_ss = bd_pair(n_att_q3);
+                    int printed = 0;
+                    for (int64_t tt = 0; tt < T && printed < 8; ++tt) {
+                      if (!at_mask[tt]) continue;
+                      const double a_t = static_cast<double>(g_arr[tt]);
+                      const double l1_t = static_cast<double>(lam1_hist[tt]);
+                      const double l2_t = static_cast<double>(lam2_hist[tt]);
+                      auto contrib = [&](const std::array<double,2>& v){ return l1_t * a_t * v[0] + l2_t * a_t * v[1]; };
+                      double c_af_an = contrib(A_bd_af_an), c_af_num = contrib(N_bd_af);
+                      double c_as_an = contrib(A_bd_as_an), c_as_num = contrib(N_bd_as);
+                      double c_sf_an = contrib(A_bd_sf_an), c_sf_num = contrib(N_bd_sf);
+                      double c_ss_an = contrib(A_bd_ss_an), c_ss_num = contrib(N_bd_ss);
+                      std::printf("[ssl_phi_trace] t=%lld a_t=%.6g l1=%.6g l2=%.6g | af an/num %.6g/%.6g | as %.6g/%.6g | sf %.6g/%.6g | ss %.6g/%.6g\n",
+                                  (long long)tt, a_t, l1_t, l2_t,
+                                  c_af_an, c_af_num, c_as_an, c_as_num, c_sf_an, c_sf_num, c_ss_an, c_ss_num);
+                      printed++;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+
+    // Chain rule from rates to time constants: R = 1/T => dL/dT = -dL/dR / T^2
+      gT_af.data_ptr<float>()[b] = - dL_dR_af / (Taf * Taf);
+      gT_as.data_ptr<float>()[b] = - dL_dR_as / (Tas * Tas);
+      gT_sf.data_ptr<float>()[b] = - dL_dR_sf / (Tsf * Tsf);
+      gT_ss.data_ptr<float>()[b] = - dL_dR_ss / (Tss * Tss);
+
+      // Optional saltation correction at gate flips (hard mask), toggled by SSL_USE_SALTATION=1
       if (salt_on) {
         // Save pre-saltation grads to report smooth vs salt totals
         const double gT_af_pre = (double)gT_af.data_ptr<float>()[b];
@@ -1525,7 +1471,7 @@ std::vector<torch::Tensor> ssl_smoother_backward(
         if (const char* e = std::getenv("SSL_SALTATION_EPS_REL")) { double v = std::atof(e); if (v>0.0) eps_rel_salt = v; }
         int max_backoff_salt = 4;
         if (const char* m = std::getenv("SSL_SALTATION_MAX_BACKOFF")) { int k = std::atoi(m); if (k>=0) max_backoff_salt = k; }
-        int max_flips = 64; // lower default to avoid heavy per-step recomputations during training
+        int max_flips = 1024;
         if (const char* mf = std::getenv("SSL_SALTATION_MAX_FLIPS")) { int k = std::atoi(mf); if (k>0) max_flips = k; }
         // One-time saltation summary per batch 0 (behind flag)
         bool log_summary = false;
@@ -1671,43 +1617,29 @@ std::vector<torch::Tensor> ssl_smoother_backward(
           auto nxt_m = nx(tau_m);
           const double dx1_dtau = (nxt_p.first  - nxt_m.first)  / (tau_p - tau_m);
           const double dx2_dtau = (nxt_p.second - nxt_m.second) / (tau_p - tau_m);
-          // Contraction with lambda for end-of-step-t state (pre-propagation capture)
-          const double lam1_t = (double)lam1_hist[t];
-          const double lam2_t = (double)lam2_hist[t];
-          const double J_tau = lam1_t * dx1_dtau + lam2_t * dx2_dtau; // d y_t / d tau contracted
-          const double J = J_tau * (double)Ts; // convert to d/d alpha within-sample
+          // Contraction with post-propagation lambda
+          const double lam1_t = (double)lam1_hist_post[t];
+          const double lam2_t = (double)lam2_hist_post[t];
+          const double J = lam1_t * dx1_dtau + lam2_t * dx2_dtau; // d y_{t+1} / d tau contracted
 
-          // For each time constant parameter, accumulate saltation contribution using local delta sensitivities
-          auto d_alpha_from_g = [&](const std::vector<double>& gseq)->double{
-            const double a = delta_tm1; // δ_{t-1}
-            const double b = delta_t;   // δ_t
-            const double da = gseq[t-1];
-            const double db = gseq[t];
-            const double denom = (b - a);
-            const double denom2 = denom * denom;
-            if (std::fabs(denom) < 1e-16) return 0.0;
-            double num = a * db - b * da; // dα = (a db - b da) / (b - a)^2
-            double g = num / denom2;
-            if (!std::isfinite(g)) g = 0.0;
-            return g;
-          };
-          const double d_alpha_af = d_alpha_from_g(g_dlnT_af);
-          const double d_alpha_as = d_alpha_from_g(g_dlnT_as);
-          const double d_alpha_sf = d_alpha_from_g(g_dlnT_sf);
-          const double d_alpha_ss = d_alpha_from_g(g_dlnT_ss);
-          // dL/dT = (dL/dα)*(dα/d ln T) * (1/T)
-          double c_af = sign_scale * J * d_alpha_af / Taf;
-          double c_as = sign_scale * J * d_alpha_as / Tas;
-          double c_sf = sign_scale * J * d_alpha_sf / Tsf;
-          double c_ss = sign_scale * J * d_alpha_ss / Tss;
+          // For each time constant parameter, accumulate saltation contribution
+          // dtau/d ln T = - (d delta / d ln T) / (d delta / dt)
+          double dn_dlnT_af = - g_dlnT_af[t] / ddelta_dt;
+          double dn_dlnT_as = - g_dlnT_as[t] / ddelta_dt;
+          double dn_dlnT_sf = - g_dlnT_sf[t] / ddelta_dt;
+          double dn_dlnT_ss = - g_dlnT_ss[t] / ddelta_dt;
+          double c_af = std::isfinite(dn_dlnT_af) ? sign_scale * J * dn_dlnT_af / Taf : 0.0;
+          double c_as = std::isfinite(dn_dlnT_as) ? sign_scale * J * dn_dlnT_as / Tas : 0.0;
+          double c_sf = std::isfinite(dn_dlnT_sf) ? sign_scale * J * dn_dlnT_sf / Tsf : 0.0;
+          double c_ss = std::isfinite(dn_dlnT_ss) ? sign_scale * J * dn_dlnT_ss / Tss : 0.0;
           gT_af.data_ptr<float>()[b] += (float)c_af;
           gT_as.data_ptr<float>()[b] += (float)c_as;
           gT_sf.data_ptr<float>()[b] += (float)c_sf;
           gT_ss.data_ptr<float>()[b] += (float)c_ss;
           salt_af_sum += c_af; salt_as_sum += c_as; salt_sf_sum += c_sf; salt_ss_sum += c_ss;
           if (dbg_salt && b==0 && (used_flips % log_every == 0) && (printed_flips < log_max)) {
-            std::printf("[salt] t=%lld alpha=%.6g tau0=%.6g delta=(%.6g,%.6g) J=%.6g contrib=(af %.6g, as %.6g, sf %.6g, ss %.6g)\n",
-                        (long long)t, alpha, tau0, delta_tm1, delta_t, J,
+            std::printf("[salt] t=%lld alpha=%.6g tau0=%.6g delta=(%.6g,%.6g) ddelta_dt=%.6g J=%.6g contrib=(af %.6g, as %.6g, sf %.6g, ss %.6g)\n",
+                        (long long)t, alpha, tau0, delta_tm1, delta_t, ddelta_dt, J,
                         c_af, c_as, c_sf, c_ss);
             printed_flips++;
           }
